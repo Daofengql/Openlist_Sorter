@@ -4,8 +4,55 @@
 #include <QCryptographicHash>
 #include <QDir>
 #include <QDirIterator>
+#include <QFile>
 #include <QFileInfo>
 #include <QSaveFile>
+
+namespace {
+
+QString extensionForVariant(const QString& variant) {
+  return variant == "raw" ? ".bin" : ".png";
+}
+
+QString cacheVersionForVariant(const QString& variant) {
+  if (variant == "preview") {
+    return "preview-decode-v2";
+  }
+  return "v1";
+}
+
+bool loadBytesFromPath(const QString& path, QByteArray* data) {
+  if (!data || path.isEmpty()) {
+    return false;
+  }
+
+  QFile file(path);
+  if (!file.open(QIODevice::ReadOnly)) {
+    return false;
+  }
+  *data = file.readAll();
+  return !data->isEmpty();
+}
+
+bool storeBytesToPath(const QString& path, const QByteArray& data) {
+  if (path.isEmpty() || data.isEmpty()) {
+    return false;
+  }
+
+  QDir directory;
+  if (!directory.mkpath(PreviewCache::cacheDirectoryPath())) {
+    return false;
+  }
+
+  QSaveFile file(path);
+  if (!file.open(QIODevice::WriteOnly)) {
+    return false;
+  }
+  file.write(data);
+  return file.commit();
+}
+
+}  // namespace
 
 QString PreviewCache::cacheDirectoryPath() {
   return QDir(QCoreApplication::applicationDirPath()).filePath("cache/previews");
@@ -61,7 +108,7 @@ bool PreviewCache::loadImage(const RemoteEntry& entry,
     return false;
   }
 
-  const QString path = cachePathForEntry(entry);
+  const QString path = cachePathForEntry(entry, "preview");
   if (cachePath) {
     *cachePath = path;
   }
@@ -84,7 +131,7 @@ bool PreviewCache::storeImage(const RemoteEntry& entry,
     return false;
   }
 
-  const QString path = cachePathForEntry(entry);
+  const QString path = cachePathForEntry(entry, "preview");
   if (cachePath) {
     *cachePath = path;
   }
@@ -108,20 +155,109 @@ bool PreviewCache::storeImage(const RemoteEntry& entry,
   return file.commit();
 }
 
-QString PreviewCache::cachePathForEntry(const RemoteEntry& entry) {
-  const QString key = cacheKeyForEntry(entry);
+bool PreviewCache::loadThumbnail(const RemoteEntry& entry,
+                                 QImage* image,
+                                 QString* cachePath) {
+  if (entry.thumb.isEmpty()) {
+    return false;
+  }
+  const QString path = cachePathForEntry(entry, "thumb");
+  if (cachePath) {
+    *cachePath = path;
+  }
+  if (!image || path.isEmpty()) {
+    return false;
+  }
+
+  QImage loaded;
+  if (!loaded.load(path)) {
+    return false;
+  }
+  *image = loaded;
+  return true;
+}
+
+bool PreviewCache::storeThumbnail(const RemoteEntry& entry,
+                                  const QImage& image,
+                                  QString* cachePath) {
+  if (entry.thumb.isEmpty() || image.isNull()) {
+    return false;
+  }
+
+  const QString path = cachePathForEntry(entry, "thumb");
+  if (cachePath) {
+    *cachePath = path;
+  }
+  if (path.isEmpty()) {
+    return false;
+  }
+
+  QDir directory;
+  if (!directory.mkpath(cacheDirectoryPath())) {
+    return false;
+  }
+
+  QSaveFile file(path);
+  if (!file.open(QIODevice::WriteOnly)) {
+    return false;
+  }
+  if (!image.save(&file, "PNG")) {
+    file.cancelWriting();
+    return false;
+  }
+  return file.commit();
+}
+
+bool PreviewCache::loadRawData(const RemoteEntry& entry,
+                               QByteArray* data,
+                               QString* cachePath) {
+  const QString path = cachePathForEntry(entry, "raw");
+  if (cachePath) {
+    *cachePath = path;
+  }
+  return loadBytesFromPath(path, data);
+}
+
+bool PreviewCache::storeRawData(const RemoteEntry& entry,
+                                const QByteArray& data,
+                                QString* cachePath) {
+  const QString path = cachePathForEntry(entry, "raw");
+  if (cachePath) {
+    *cachePath = path;
+  }
+  return storeBytesToPath(path, data);
+}
+
+bool PreviewCache::loadImageData(const RemoteEntry& entry,
+                                 QByteArray* data,
+                                 QString* cachePath) {
+  const QString path = cachePathForEntry(entry, "preview");
+  if (cachePath) {
+    *cachePath = path;
+  }
+  return loadBytesFromPath(path, data);
+}
+
+QString PreviewCache::cachePathForEntry(const RemoteEntry& entry,
+                                        const QString& variant) {
+  const QString key = cacheKeyForEntry(entry, variant);
   if (key.isEmpty()) {
     return {};
   }
-  return QDir(cacheDirectoryPath()).filePath(key + ".png");
+  return QDir(cacheDirectoryPath()).filePath(key + extensionForVariant(variant));
 }
 
-QString PreviewCache::cacheKeyForEntry(const RemoteEntry& entry) {
+QString PreviewCache::cacheKeyForEntry(const RemoteEntry& entry,
+                                       const QString& variant) {
   if (entry.path.isEmpty()) {
     return {};
   }
 
   QByteArray material;
+  material.append(cacheVersionForVariant(variant).toUtf8());
+  material.append('\n');
+  material.append(variant.toUtf8());
+  material.append('\n');
   material.append(entry.path.toUtf8());
   material.append('\n');
   material.append(QByteArray::number(entry.size));
@@ -129,6 +265,10 @@ QString PreviewCache::cacheKeyForEntry(const RemoteEntry& entry) {
   material.append(entry.modified.toUTC().toString(Qt::ISODateWithMs).toUtf8());
   material.append('\n');
   material.append(entry.name.toUtf8());
+  if (variant == "thumb") {
+    material.append('\n');
+    material.append(entry.thumb.toUtf8());
+  }
 
   const QByteArray digest =
       QCryptographicHash::hash(material, QCryptographicHash::Sha256).toHex();

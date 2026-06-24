@@ -3,6 +3,7 @@
 
 #include <QCheckBox>
 #include <QCloseEvent>
+#include <QImage>
 #include <QLabel>
 #include <QLineEdit>
 #include <QListWidget>
@@ -20,6 +21,9 @@
 
 #include "api/openlist_client.h"
 #include "core/models.h"
+#include "ui/zoomable_image_label.h"
+
+struct ImageConversionResult;
 
 class MainWindow : public QMainWindow {
   Q_OBJECT
@@ -55,6 +59,15 @@ class MainWindow : public QMainWindow {
   void setOperationStatus(const QString& message);
   void updateEndpointStatus();
   void chooseSourceDirectory();
+  void chooseDownloadDirectory();
+  void downloadCurrentFile();
+  void downloadCurrentFileFromUrl(const FileItem& item, const QUrl& url);
+  void fetchFileData(const FileItem& item,
+                     OpenListClient::DownloadCallback callback);
+  void fetchFileDataFromUrl(const RemoteEntry& entry,
+                            const QUrl& url,
+                            OpenListClient::DownloadCallback callback);
+  void convertCurrentFileOnly();
   void enterClassificationMode();
   void exitClassificationMode();
   void loadSourceDirectory();
@@ -65,10 +78,16 @@ class MainWindow : public QMainWindow {
   void renderVideo(const FileItem& item, const QString& rawUrl);
   void showInfoPage(const QString& title, const QString& body);
   QString formatEntryInfo(const FileItem& item) const;
+  bool imageLargeEnoughForPreview(const QImage& image) const;
   void updateImagePreviewScale();
 
   void rebuildFileList();
   void updateFileListRow(int index);
+  int pageStartIndex() const;
+  int pageEndIndex() const;
+  void setCurrentPage(int page);
+  void ensurePageForIndex(int index);
+  void refreshFilePageControls();
   void refreshStats();
   void refreshTagTable();
   void rebuildTagChecks();
@@ -84,6 +103,17 @@ class MainWindow : public QMainWindow {
   void savePending();
   void submitNextFile(const QVector<int>& pendingIndexes, int position);
   void submitFile(int index, OpenListClient::SimpleCallback callback);
+  void submitConvertedImage(int index,
+                            const QStringList& targetDirs,
+                            OpenListClient::SimpleCallback callback);
+  void uploadConvertedImageTargets(int index,
+                                   const ImageConversionResult& converted,
+                                   const QStringList& targetDirs,
+                                   int targetPosition,
+                                   OpenListClient::SimpleCallback callback);
+  void removeSubmittedSourceFile(int index,
+                                 const QString& successMessage,
+                                 OpenListClient::SimpleCallback callback);
   void submitCopyTargets(int fileIndex,
                          const QStringList& selectedTags,
                          int tagPosition,
@@ -97,9 +127,14 @@ class MainWindow : public QMainWindow {
 
   QLineEdit* sourcePathEdit_{};
   QPushButton* browseSourceButton_{};
+  QLineEdit* downloadPathEdit_{};
+  QPushButton* browseDownloadPathButton_{};
+  QPushButton* downloadCurrentButton_{};
+  QPushButton* convertCurrentButton_{};
   QPushButton* enterModeButton_{};
   QPushButton* saveButton_{};
   QCheckBox* overwriteCheck_{};
+  QCheckBox* convertImageMoveCheck_{};
 
   QLabel* totalLabel_{};
   QLabel* submittedLabel_{};
@@ -108,6 +143,9 @@ class MainWindow : public QMainWindow {
   QLabel* currentIndexLabel_{};
 
   QListWidget* fileList_{};
+  QPushButton* prevPageButton_{};
+  QPushButton* nextPageButton_{};
+  QLabel* pageInfoLabel_{};
 
   QLabel* currentPathLabel_{};
   QLabel* previewTitleLabel_{};
@@ -117,7 +155,7 @@ class MainWindow : public QMainWindow {
   QWidget* videoPage_{};
   QWidget* infoPage_{};
   QLabel* emptyLabel_{};
-  QLabel* imageLabel_{};
+  ZoomableImageLabel* imageLabel_{};
   QLabel* infoLabel_{};
   QVideoWidget* videoWidget_{};
   QMediaPlayer* mediaPlayer_{};
@@ -142,8 +180,11 @@ class MainWindow : public QMainWindow {
   QVector<TagMapping> tags_;
   QVector<FileItem> files_;
   int currentIndex_{-1};
+  int currentPage_{};
+  int pageSize_{100};
   bool classificationMode_{};
   bool submitInProgress_{};
+  bool downloadInProgress_{};
   bool suppressTagChange_{};
   QPixmap currentPixmap_;
 };

@@ -2,9 +2,13 @@
 
 OpenList Sorter 是一个 Qt5 桌面端远程文件分类工具，用连续预览、tag 暂存和批量提交来加速 OpenList/Alist 目录整理。
 
-详细设计见 [DESIGN.md](DESIGN.md)。
-
 启动时会先进入连接页。连接成功后才显示分类主窗口；主窗口顶部提供文件、编辑、帮助菜单，底部状态栏显示当前 endpoint。
+
+主窗口可以设置默认本地下载目录，并下载当前远程文件。下载和图片转换会优先复用本地 raw 原始字节缓存，避免重复下载。
+
+图片可以启用“保存时转 WebP”：保存分类时会先使用原始远程文件字节转换，并按原始文件 SHA-256 命名后上传到一个或多个 tag 目标目录，全部成功后删除 OpenList 源目录中的原文件。只有原始文件无法直接转换、必须通过 HEIC/ffmpeg 等路径解码时，才会使用本地解码缓存转换，此时 SHA-256 来源也是这份解码缓存。也可以使用“仅转换当前”，把当前图片转成 WebP 上传回原目录并删除原文件。
+
+左侧目录文件列表默认每 100 个文件分页显示，文件编号仍然是整个目录内的全局编号。上一张/下一张跨页时会自动切换分页；待提交选择保存在内存里的完整文件列表上，不会因为翻页丢失。
 
 ## Windows 构建
 
@@ -21,6 +25,22 @@ cmake -S . -B build-qt `
 cmake --build build-qt --target openlist_sorter -j 4
 ```
 
+非 Qt 的图片运行库使用项目相对路径，默认从 `third_party/runtime` 读取：
+
+```text
+third_party/runtime/
+  ffmpeg/
+    bin/*.dll
+    include/libav*
+  imagemagick/
+    CORE_RL_MagickWand_.dll
+    CORE_RL_*.dll
+    *.xml
+    modules/
+```
+
+这些 DLL 不提交到 Git。换机器构建或打包时，把同样结构放到项目目录下即可；CMake 会复制到 `build-qt/dist/runtime`。
+
 构建完成后运行：
 
 ```powershell
@@ -29,13 +49,17 @@ cmake --build build-qt --target openlist_sorter -j 4
 
 ## 图片预览
 
-程序会先使用 Qt5 自带图片解码和 imageformats 插件预览图片。如果 Qt 无法直接读取 HEIC、AVIF、RAW 等格式，会尝试调用本机 `magick.exe` 临时转码为 PNG 后显示。
+程序会先使用 Qt5 自带图片解码和 imageformats 插件预览图片。如果 Qt 无法直接读取 HEIC、AVIF、RAW 等格式，会尝试通过项目内的 ImageMagick MagickWand DLL 在内存中转码为 PNG 后显示。
 
-如果 ImageMagick 也无法处理，例如遇到扩展名和真实容器不一致、或 HEIC/HEIF 元数据结构异常的图片，程序会再尝试调用 `ffmpeg.exe` 转出主图 PNG。对于 HEIC grid/tile 图片，这通常能得到完整拼合后的图像。
+如果 ImageMagick 也无法处理，例如遇到扩展名和真实容器不一致、或 HEIC/HEIF 元数据结构异常的图片，程序会再尝试通过 FFmpeg DLL 直接从内存解码主图。对于 HEIC grid/tile 图片，这通常能得到完整拼合后的图像。
 
-本机已经安装 ImageMagick / FFmpeg 时通常不需要额外配置；如果都不可用，少见图片格式会退回文件信息页，分类和保存功能不受影响。
+如果项目相对目录下没有 ImageMagick / FFmpeg DLL，少见图片格式会退回文件信息页，分类和保存功能不受影响。
 
 图片预览会缓存到程序运行目录下的 `cache/previews`。缓存 key 包含远程路径、大小和修改时间，因此同一个文件再次查看时会直接读取 PNG 缓存，远程文件变化后会自动生成新的缓存。
+
+如果 OpenList/Alist 返回了图片缩略图，程序会先尝试加载并缓存缩略图；缩略图尺寸足够时直接用于预览，尺寸不足时再下载原图解码。
+
+图片预览区域支持鼠标滚轮缩放、按住左键拖动查看，双击可复位到适配窗口。
 
 ## HTTPS / TLS
 

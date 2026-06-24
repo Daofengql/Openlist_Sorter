@@ -16,7 +16,9 @@ set(CMAKE_AUTORCC ON)
 
 set(OPENLIST_SORTER_QT_ROOT "" CACHE PATH "Optional Qt5 installation prefix")
 set(OPENLIST_SORTER_OPENSSL_ROOT "" CACHE PATH "Optional OpenSSL runtime prefix or bin directory")
-set(OPENLIST_SORTER_FFMPEG_ROOT "" CACHE PATH "Optional FFmpeg runtime prefix or bin directory")
+set(OPENLIST_SORTER_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/runtime" CACHE PATH "Project-relative third-party runtime root")
+set(OPENLIST_SORTER_FFMPEG_RUNTIME_DIR "${OPENLIST_SORTER_RUNTIME_ROOT}/ffmpeg" CACHE PATH "FFmpeg DLL runtime directory")
+set(OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR "${OPENLIST_SORTER_RUNTIME_ROOT}/imagemagick" CACHE PATH "ImageMagick DLL runtime directory")
 set(OPENLIST_SORTER_DIST_DIR "${CMAKE_BINARY_DIR}/dist" CACHE PATH "Directory for distributable output")
 
 if(OPENLIST_SORTER_QT_ROOT)
@@ -32,8 +34,16 @@ add_executable(openlist_sorter
   src/core/connection_profile.cpp
   src/core/connection_profile.h
   src/core/models.h
+  src/core/runtime_paths.cpp
+  src/core/runtime_paths.h
+  src/preview/ffmpeg_image_decoder.cpp
+  src/preview/ffmpeg_image_decoder.h
+  src/preview/image_converter.cpp
+  src/preview/image_converter.h
   src/preview/image_decoder.cpp
   src/preview/image_decoder.h
+  src/preview/magick_wand_bridge.cpp
+  src/preview/magick_wand_bridge.h
   src/preview/preview_cache.cpp
   src/preview/preview_cache.h
   src/ui/connection_dialog.cpp
@@ -44,7 +54,15 @@ add_executable(openlist_sorter
   src/ui/main_window.h
   src/ui/remote_directory_dialog.cpp
   src/ui/remote_directory_dialog.h
+  src/ui/zoomable_image_label.cpp
+  src/ui/zoomable_image_label.h
+  src/resources/resources.qrc
 )
+
+if(WIN32)
+  enable_language(RC)
+  target_sources(openlist_sorter PRIVATE src/resources/app.rc)
+endif()
 
 set_target_properties(openlist_sorter PROPERTIES
   OUTPUT_NAME "OpenListSorter"
@@ -65,6 +83,28 @@ target_include_directories(openlist_sorter PRIVATE
 )
 
 target_compile_definitions(openlist_sorter PRIVATE QT_NO_KEYWORDS)
+
+set(OPENLIST_SORTER_FFMPEG_INCLUDE_DIR
+  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/include")
+file(GLOB OPENLIST_SORTER_FFMPEG_RUNTIME_DLLS
+  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/avcodec-*.dll"
+  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/avformat-*.dll"
+  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/avutil-*.dll"
+  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/swscale-*.dll")
+if(EXISTS "${OPENLIST_SORTER_FFMPEG_INCLUDE_DIR}/libavformat/avformat.h"
+   AND OPENLIST_SORTER_FFMPEG_RUNTIME_DLLS)
+  target_include_directories(openlist_sorter PRIVATE
+    "${OPENLIST_SORTER_FFMPEG_INCLUDE_DIR}"
+  )
+  target_compile_definitions(openlist_sorter PRIVATE
+    OPENLIST_SORTER_HAS_FFMPEG_DLL=1
+  )
+else()
+  target_compile_definitions(openlist_sorter PRIVATE
+    OPENLIST_SORTER_HAS_FFMPEG_DLL=0
+  )
+  message(WARNING "FFmpeg DLL runtime was not found under ${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}; uncommon image fallback will be disabled.")
+endif()
 
 target_link_libraries(openlist_sorter PRIVATE
   Qt5::Widgets
@@ -172,23 +212,149 @@ if(WIN32)
     message(WARNING "OpenSSL runtime DLLs were not found; HTTPS requests may fail with TLS initialization failed.")
   endif()
 
-  find_program(OPENLIST_SORTER_FFMPEG_EXECUTABLE
-    NAMES ffmpeg
-    HINTS
-      "${OPENLIST_SORTER_FFMPEG_ROOT}"
-      "${OPENLIST_SORTER_FFMPEG_ROOT}/bin"
-      "D:/env/ffmpeg/bin"
-    DOC "Optional FFmpeg executable for difficult image preview transcoding"
+  add_custom_command(TARGET openlist_sorter POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf
+            "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg"
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf
+            "$<TARGET_FILE_DIR:openlist_sorter>/runtime/imagemagick"
+    COMMENT "Cleaning third-party runtime output"
+    VERBATIM
   )
-  if(OPENLIST_SORTER_FFMPEG_EXECUTABLE)
+
+  if(EXISTS "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin")
     add_custom_command(TARGET openlist_sorter POST_BUILD
-      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-              "${OPENLIST_SORTER_FFMPEG_EXECUTABLE}"
-              "$<TARGET_FILE_DIR:openlist_sorter>"
-      COMMENT "Deploying FFmpeg image preview fallback"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg/bin"
+      COMMENT "Deploying FFmpeg DLL runtime"
       VERBATIM
     )
+    foreach(ffmpeg_dll_pattern IN ITEMS
+        avcodec-*.dll
+        avformat-*.dll
+        avutil-*.dll
+        swresample-*.dll
+        swscale-*.dll)
+      file(GLOB OPENLIST_SORTER_FFMPEG_DEPLOY_DLLS
+        "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/${ffmpeg_dll_pattern}")
+      foreach(ffmpeg_dll IN LISTS OPENLIST_SORTER_FFMPEG_DEPLOY_DLLS)
+        add_custom_command(TARGET openlist_sorter POST_BUILD
+          COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                  "${ffmpeg_dll}"
+                  "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg/bin"
+          COMMENT "Deploying ${ffmpeg_dll_pattern}"
+          VERBATIM
+        )
+      endforeach()
+    endforeach()
   endif()
+
+  if(EXISTS "${OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR}/CORE_RL_MagickWand_.dll")
+    add_custom_command(TARGET openlist_sorter POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "$<TARGET_FILE_DIR:openlist_sorter>/runtime/imagemagick"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "$<TARGET_FILE_DIR:openlist_sorter>/runtime/imagemagick/modules/coders"
+      COMMAND "${CMAKE_COMMAND}" -E make_directory
+              "$<TARGET_FILE_DIR:openlist_sorter>/runtime/imagemagick/modules/filters"
+      COMMENT "Deploying ImageMagick DLL runtime"
+      VERBATIM
+    )
+    foreach(imagemagick_runtime_file IN ITEMS
+        CORE_RL_brotli_.dll
+        CORE_RL_bzlib_.dll
+        CORE_RL_freetype_.dll
+        CORE_RL_fribidi_.dll
+        CORE_RL_glib_.dll
+        CORE_RL_harfbuzz_.dll
+        CORE_RL_heif_.dll
+        CORE_RL_jpeg-turbo_.dll
+        CORE_RL_jpeg-xl_.dll
+        CORE_RL_lcms_.dll
+        CORE_RL_lqr_.dll
+        CORE_RL_lzma_.dll
+        CORE_RL_MagickCore_.dll
+        CORE_RL_MagickWand_.dll
+        CORE_RL_openjpeg_.dll
+        CORE_RL_png_.dll
+        CORE_RL_raw_.dll
+        CORE_RL_tiff_.dll
+        CORE_RL_webp_.dll
+        CORE_RL_xml_.dll
+        CORE_RL_zip_.dll
+        CORE_RL_zlib_.dll
+        colors.xml
+        configure.xml
+        delegates.xml
+        english.xml
+        locale.xml
+        log.xml
+        policy.xml
+        thresholds.xml
+        type.xml
+        License.txt
+        NOTICE.txt
+        msvcp140_1.dll
+        msvcp140_2.dll
+        msvcp140_atomic_wait.dll
+        msvcp140_codecvt_ids.dll
+        msvcp140.dll
+        vcomp140.dll
+        vcruntime140_1.dll
+        vcruntime140_threads.dll
+        vcruntime140.dll)
+      if(EXISTS "${OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR}/${imagemagick_runtime_file}")
+        add_custom_command(TARGET openlist_sorter POST_BUILD
+          COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                  "${OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR}/${imagemagick_runtime_file}"
+                  "$<TARGET_FILE_DIR:openlist_sorter>/runtime/imagemagick"
+          COMMENT "Deploying ImageMagick ${imagemagick_runtime_file}"
+          VERBATIM
+        )
+      endif()
+    endforeach()
+    foreach(imagemagick_coder IN ITEMS
+        IM_MOD_RL_bmp_.dll
+        IM_MOD_RL_dng_.dll
+        IM_MOD_RL_gif_.dll
+        IM_MOD_RL_heic_.dll
+        IM_MOD_RL_icon_.dll
+        IM_MOD_RL_jp2_.dll
+        IM_MOD_RL_jpeg_.dll
+        IM_MOD_RL_jxl_.dll
+        IM_MOD_RL_magick_.dll
+        IM_MOD_RL_miff_.dll
+        IM_MOD_RL_png_.dll
+        IM_MOD_RL_pnm_.dll
+        IM_MOD_RL_psd_.dll
+        IM_MOD_RL_raw_.dll
+        IM_MOD_RL_tga_.dll
+        IM_MOD_RL_tiff_.dll
+        IM_MOD_RL_wbmp_.dll
+        IM_MOD_RL_webp_.dll)
+      if(EXISTS "${OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR}/modules/coders/${imagemagick_coder}")
+        add_custom_command(TARGET openlist_sorter POST_BUILD
+          COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                  "${OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR}/modules/coders/${imagemagick_coder}"
+                  "$<TARGET_FILE_DIR:openlist_sorter>/runtime/imagemagick/modules/coders"
+          COMMENT "Deploying ImageMagick coder ${imagemagick_coder}"
+          VERBATIM
+        )
+      endif()
+    endforeach()
+  else()
+    message(WARNING "ImageMagick DLL runtime was not found under ${OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR}; WebP conversion and uncommon image fallback will be unavailable.")
+  endif()
+
+  foreach(stale_tool IN ITEMS ffmpeg.exe ffplay.exe ffprobe.exe magick.exe)
+    add_custom_command(TARGET openlist_sorter POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E rm -f
+              "$<TARGET_FILE_DIR:openlist_sorter>/${stale_tool}"
+      COMMENT "Removing stale external tool ${stale_tool}"
+      VERBATIM
+    )
+  endforeach()
 elseif(UNIX AND NOT APPLE)
   set_target_properties(openlist_sorter PROPERTIES
     BUILD_RPATH "$ORIGIN"

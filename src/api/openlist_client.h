@@ -46,6 +46,13 @@ class OpenListClient : public QObject {
                      ListCallback callback);
   void getFileInfo(const QString& path, EntryCallback callback);
   void downloadUrl(const QUrl& url, DownloadCallback callback);
+  void uploadFile(const QString& remotePath,
+                  const QByteArray& data,
+                  bool overwrite,
+                  SimpleCallback callback);
+  void removeFile(const QString& dir,
+                  const QString& fileName,
+                  SimpleCallback callback);
   void moveFile(const QString& srcDir,
                 const QString& fileName,
                 const QString& dstDir,

@@ -8,6 +8,11 @@ cache/
 cmake-build-*/
 compile_commands.json
 
+third_party/runtime/ffmpeg/bin/
+third_party/runtime/ffmpeg/include/
+third_party/runtime/ffmpeg/LICENSE.txt
+third_party/runtime/imagemagick/
+
 *.o
 *.obj
 *.so

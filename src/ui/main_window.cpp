@@ -6,9 +6,11 @@
 #include <QAbstractItemView>
 #include <QAction>
 #include <QApplication>
+#include <QBuffer>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
@@ -25,14 +27,19 @@
 #include <QMenuBar>
 #include <QMessageBox>
 #include <QResizeEvent>
+#include <QSaveFile>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSplitter>
 #include <QStatusBar>
+#include <QStandardPaths>
+#include <QStyle>
 #include <QTextStream>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrent>
 
+#include "preview/image_converter.h"
 #include "preview/image_decoder.h"
 #include "preview/preview_cache.h"
 #include "ui/connection_dialog.h"
@@ -80,9 +87,23 @@ struct ImageCacheLoadResult {
   QImage image;
 };
 
+struct ThumbnailLoadResult {
+  bool ok{};
+  bool fromCache{};
+  QImage image;
+  QString message;
+};
+
 ImageCacheLoadResult loadCachedImageTask(const RemoteEntry& entry) {
   ImageCacheLoadResult result;
   result.ok = PreviewCache::loadImage(entry, &result.image);
+  return result;
+}
+
+ThumbnailLoadResult loadCachedThumbnailTask(const RemoteEntry& entry) {
+  ThumbnailLoadResult result;
+  result.fromCache = true;
+  result.ok = PreviewCache::loadThumbnail(entry, &result.image);
   return result;
 }
 
@@ -94,6 +115,78 @@ ImageDecodeResult decodeImageTask(const QByteArray& data,
     PreviewCache::storeImage(cacheEntry, result.image);
   }
   return result;
+}
+
+ThumbnailLoadResult decodeThumbnailTask(const QByteArray& data,
+                                        const QString& fileName,
+                                        const RemoteEntry& cacheEntry) {
+  ThumbnailLoadResult result;
+  result.ok = false;
+  ImageDecodeResult decoded = ImageDecoder::decodeToImage(data, fileName);
+  if (!decoded.ok) {
+    result.message = decoded.message;
+    return result;
+  }
+  result.ok = true;
+  result.image = decoded.image;
+  PreviewCache::storeThumbnail(cacheEntry, result.image);
+  return result;
+}
+
+QByteArray encodePngData(const QImage& image) {
+  QByteArray data;
+  QBuffer buffer(&data);
+  buffer.open(QIODevice::WriteOnly);
+  image.save(&buffer, "PNG");
+  return data;
+}
+
+ImageConversionResult convertImageToWebpTask(const QByteArray& data,
+                                             const QString& fileName,
+                                             const RemoteEntry& cacheEntry) {
+  ImageConversionResult rawResult =
+      ImageConverter::convertToWebp(data, fileName, "原始文件");
+  if (rawResult.ok) {
+    return rawResult;
+  }
+
+  QByteArray previewData;
+  if (!PreviewCache::loadImageData(cacheEntry, &previewData)) {
+    ImageDecodeResult decoded = ImageDecoder::decodeToImage(data, fileName);
+    if (!decoded.ok) {
+      rawResult.message += "；解码缓存生成失败: " + decoded.message;
+      return rawResult;
+    }
+    PreviewCache::storeImage(cacheEntry, decoded.image);
+    previewData = encodePngData(decoded.image);
+  }
+
+  ImageConversionResult cachedResult = ImageConverter::convertToWebp(
+      previewData, QFileInfo(fileName).completeBaseName() + ".png", "解码缓存");
+  if (!cachedResult.ok) {
+    cachedResult.message =
+        "原始文件转 WebP 失败: " + rawResult.message +
+        "；解码缓存转 WebP 失败: " + cachedResult.message;
+  }
+  return cachedResult;
+}
+
+QUrl resolvedOpenListUrl(const QString& baseUrl, const QString& urlText) {
+  const QString trimmed = urlText.trimmed();
+  if (trimmed.isEmpty()) {
+    return {};
+  }
+
+  QUrl url(trimmed);
+  if (url.isValid() && !url.isRelative()) {
+    return url;
+  }
+
+  QUrl base(baseUrl);
+  if (!base.path().endsWith('/')) {
+    base.setPath(base.path() + "/");
+  }
+  return base.resolved(QUrl(trimmed));
 }
 
 }  // namespace
@@ -118,7 +211,6 @@ void MainWindow::closeEvent(QCloseEvent* event) {
 
 void MainWindow::resizeEvent(QResizeEvent* event) {
   QMainWindow::resizeEvent(event);
-  updateImagePreviewScale();
 }
 
 void MainWindow::buildUi() {
@@ -158,7 +250,6 @@ void MainWindow::buildUi() {
 void MainWindow::buildMenuBar() {
   QMenu* fileMenu = menuBar()->addMenu("文件(&F)");
   QAction* connectionInfoAction = fileMenu->addAction("连接信息...");
-  QAction* reconnectAction = fileMenu->addAction("重新连接...");
   fileMenu->addSeparator();
   QAction* exitAction = fileMenu->addAction("退出");
 
@@ -173,9 +264,6 @@ void MainWindow::buildMenuBar() {
 
   QObject::connect(connectionInfoAction, &QAction::triggered, this,
                    &MainWindow::showConnectionInfoDialog);
-  QObject::connect(reconnectAction, &QAction::triggered, this, [this]() {
-    showConnectionDialog();
-  });
   QObject::connect(exitAction, &QAction::triggered, this, &QWidget::close);
   QObject::connect(clearCurrentAction, &QAction::triggered, this,
                    &MainWindow::clearCurrentSelection);
@@ -198,20 +286,38 @@ void MainWindow::buildTaskPanel(QVBoxLayout* rootLayout) {
   sourcePathEdit_ = new QLineEdit("/");
   sourcePathEdit_->setReadOnly(true);
   browseSourceButton_ = new QPushButton("选择源目录");
+  downloadPathEdit_ = new QLineEdit();
+  downloadPathEdit_->setReadOnly(true);
+  downloadPathEdit_->setPlaceholderText("默认下载目录");
+  browseDownloadPathButton_ = new QPushButton("下载目录");
+  downloadCurrentButton_ = new QPushButton("下载当前");
+  convertCurrentButton_ = new QPushButton("仅转换当前");
   enterModeButton_ = new QPushButton("进入分类模式");
   saveButton_ = new QPushButton("保存待提交");
   saveButton_->setObjectName("primaryButton");
   overwriteCheck_ = new QCheckBox("覆盖同名文件");
+  convertImageMoveCheck_ = new QCheckBox("保存时转 WebP");
+  convertImageMoveCheck_->setToolTip(
+      "图片保存时先转成 WebP 上传到目标目录，成功后删除 OpenList 源文件。");
 
   auto* title = new QLabel("分类任务");
   title->setObjectName("sectionTitle");
   layout->addWidget(title, 0, 0);
-  layout->addWidget(new QLabel("源目录"), 0, 1);
-  layout->addWidget(sourcePathEdit_, 0, 2, 1, 3);
-  layout->addWidget(browseSourceButton_, 0, 6);
-  layout->addWidget(enterModeButton_, 0, 7);
-  layout->addWidget(saveButton_, 0, 8);
-  layout->addWidget(overwriteCheck_, 0, 9);
+  layout->addWidget(browseSourceButton_, 0, 1);
+  layout->addWidget(sourcePathEdit_, 0, 2, 1, 4);
+  layout->addWidget(enterModeButton_, 0, 6);
+  layout->addWidget(saveButton_, 0, 7);
+  layout->addWidget(overwriteCheck_, 0, 8);
+  layout->addWidget(new QLabel("下载到"), 1, 0);
+  layout->addWidget(browseDownloadPathButton_, 1, 1);
+  layout->addWidget(downloadPathEdit_, 1, 2, 1, 3);
+  layout->addWidget(downloadCurrentButton_, 1, 6);
+  layout->addWidget(convertCurrentButton_, 1, 7);
+  layout->addWidget(convertImageMoveCheck_, 1, 8);
+  layout->setColumnStretch(2, 1);
+  layout->setColumnStretch(3, 1);
+  layout->setColumnStretch(4, 1);
+  layout->setColumnStretch(5, 1);
 
   rootLayout->addWidget(panel);
 }
@@ -248,6 +354,26 @@ QWidget* MainWindow::buildFilePanel() {
 
   auto* title = new QLabel("当前目录文件");
   title->setObjectName("sectionTitle");
+  auto* pageRow = new QHBoxLayout();
+  pageRow->setContentsMargins(0, 0, 0, 0);
+  pageRow->setSpacing(8);
+  prevPageButton_ = new QPushButton();
+  nextPageButton_ = new QPushButton();
+  prevPageButton_->setIcon(style()->standardIcon(QStyle::SP_ArrowLeft));
+  nextPageButton_->setIcon(style()->standardIcon(QStyle::SP_ArrowRight));
+  prevPageButton_->setToolTip("上一页");
+  nextPageButton_->setToolTip("下一页");
+  prevPageButton_->setFixedSize(34, 30);
+  nextPageButton_->setFixedSize(34, 30);
+  prevPageButton_->setIconSize(QSize(16, 16));
+  nextPageButton_->setIconSize(QSize(16, 16));
+  pageInfoLabel_ = new QLabel("第 0 / 0 页");
+  pageInfoLabel_->setObjectName("subtleLabel");
+  pageInfoLabel_->setAlignment(Qt::AlignCenter);
+  pageRow->addWidget(prevPageButton_);
+  pageRow->addWidget(pageInfoLabel_, 1);
+  pageRow->addWidget(nextPageButton_);
+
   fileList_ = new QListWidget();
   fileList_->setSelectionMode(QAbstractItemView::SingleSelection);
   fileList_->setAlternatingRowColors(true);
@@ -257,6 +383,7 @@ QWidget* MainWindow::buildFilePanel() {
   fileList_->setWordWrap(false);
 
   layout->addWidget(title);
+  layout->addLayout(pageRow);
   layout->addWidget(fileList_, 1);
   return panel;
 }
@@ -292,8 +419,7 @@ QWidget* MainWindow::buildPreviewPanel() {
   imagePage_ = new QWidget();
   auto* imageLayout = new QVBoxLayout(imagePage_);
   imageLayout->setContentsMargins(0, 0, 0, 0);
-  imageLabel_ = new QLabel();
-  imageLabel_->setAlignment(Qt::AlignCenter);
+  imageLabel_ = new ZoomableImageLabel();
   imageLabel_->setMinimumSize(320, 240);
   imageLabel_->setObjectName("imagePreview");
   imageLayout->addWidget(imageLabel_, 1);
@@ -402,6 +528,12 @@ QWidget* MainWindow::buildTagPanel() {
 void MainWindow::connectSignals() {
   QObject::connect(browseSourceButton_, &QPushButton::clicked, this,
                    &MainWindow::chooseSourceDirectory);
+  QObject::connect(browseDownloadPathButton_, &QPushButton::clicked, this,
+                   &MainWindow::chooseDownloadDirectory);
+  QObject::connect(downloadCurrentButton_, &QPushButton::clicked, this,
+                   &MainWindow::downloadCurrentFile);
+  QObject::connect(convertCurrentButton_, &QPushButton::clicked, this,
+                   &MainWindow::convertCurrentFileOnly);
   QObject::connect(enterModeButton_, &QPushButton::clicked, this, [this]() {
     if (classificationMode_) {
       exitClassificationMode();
@@ -423,10 +555,22 @@ void MainWindow::connectSignals() {
   QObject::connect(nextButton_, &QPushButton::clicked, this, [this]() {
     setCurrentIndex(currentIndex_ + 1);
   });
+  QObject::connect(prevPageButton_, &QPushButton::clicked, this, [this]() {
+    setCurrentPage(currentPage_ - 1);
+  });
+  QObject::connect(nextPageButton_, &QPushButton::clicked, this, [this]() {
+    setCurrentPage(currentPage_ + 1);
+  });
   QObject::connect(fileList_, &QListWidget::currentRowChanged, this,
                    [this](int row) {
-                     if (row >= 0 && row != currentIndex_) {
-                       setCurrentIndex(row);
+                     QListWidgetItem* item = fileList_->item(row);
+                     if (!item) {
+                       return;
+                     }
+                     bool ok = false;
+                     const int index = item->data(Qt::UserRole).toInt(&ok);
+                     if (ok && index >= 0 && index != currentIndex_) {
+                       setCurrentIndex(index);
                      }
                    });
   QObject::connect(playPauseButton_, &QPushButton::clicked, this, [this]() {
@@ -605,6 +749,36 @@ void MainWindow::applyModernStyle() {
       background: transparent;
       spacing: 8px;
     }
+    QScrollBar:vertical {
+      background: #f8fafc;
+      width: 10px;
+      margin: 2px;
+      border: 0;
+      border-radius: 5px;
+    }
+    QScrollBar:horizontal {
+      background: #f8fafc;
+      height: 10px;
+      margin: 2px;
+      border: 0;
+      border-radius: 5px;
+    }
+    QScrollBar::handle:vertical, QScrollBar::handle:horizontal {
+      background: #cbd5e1;
+      border-radius: 5px;
+      min-height: 32px;
+      min-width: 32px;
+    }
+    QScrollBar::handle:vertical:hover, QScrollBar::handle:horizontal:hover {
+      background: #94a3b8;
+    }
+    QScrollBar::add-line, QScrollBar::sub-line,
+    QScrollBar::add-page, QScrollBar::sub-page {
+      background: transparent;
+      border: 0;
+      width: 0;
+      height: 0;
+    }
     QSplitter::handle {
       background: #eef2f7;
     }
@@ -615,6 +789,12 @@ void MainWindow::loadSettings() {
   QSettings settings;
   sourcePath_ = normalizeRemotePath(settings.value("task/sourcePath", "/").toString());
   sourcePathEdit_->setText(sourcePath_);
+  const QString defaultDownloadPath =
+      QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+  downloadPathEdit_->setText(
+      settings.value("task/downloadPath", defaultDownloadPath).toString());
+  convertImageMoveCheck_->setChecked(
+      settings.value("task/convertImageMove", false).toBool());
 
   const int tagCount = settings.beginReadArray("tags");
   tags_.clear();
@@ -635,6 +815,9 @@ void MainWindow::loadSettings() {
 void MainWindow::saveSettings() const {
   QSettings settings;
   settings.setValue("task/sourcePath", sourcePath_);
+  settings.setValue("task/downloadPath", downloadPathEdit_->text());
+  settings.setValue("task/convertImageMove",
+                    convertImageMoveCheck_->isChecked());
 
   settings.beginWriteArray("tags");
   for (int i = 0; i < tags_.size(); ++i) {
@@ -655,6 +838,7 @@ bool MainWindow::showConnectionDialog(bool initialLaunch) {
 
   files_.clear();
   currentIndex_ = -1;
+  currentPage_ = 0;
   classificationMode_ = false;
   rebuildFileList();
   rebuildTagChecks();
@@ -788,6 +972,200 @@ void MainWindow::chooseSourceDirectory() {
   }
 }
 
+void MainWindow::chooseDownloadDirectory() {
+  const QString startPath = downloadPathEdit_->text().isEmpty()
+                                ? QStandardPaths::writableLocation(
+                                      QStandardPaths::DownloadLocation)
+                                : downloadPathEdit_->text();
+  const QString directory = QFileDialog::getExistingDirectory(
+      this, "选择默认下载目录", startPath);
+  if (directory.isEmpty()) {
+    return;
+  }
+
+  downloadPathEdit_->setText(QDir::toNativeSeparators(directory));
+  saveSettings();
+}
+
+void MainWindow::downloadCurrentFile() {
+  const FileItem* item = currentFile();
+  if (!item) {
+    QMessageBox::information(this, "没有当前文件", "请先选择一个文件。");
+    return;
+  }
+  if (downloadInProgress_) {
+    return;
+  }
+
+  QString downloadDirectory = downloadPathEdit_->text().trimmed();
+  if (downloadDirectory.isEmpty()) {
+    chooseDownloadDirectory();
+    downloadDirectory = downloadPathEdit_->text().trimmed();
+    if (downloadDirectory.isEmpty()) {
+      return;
+    }
+  }
+  if (!QDir().mkpath(downloadDirectory)) {
+    QMessageBox::warning(this, "下载目录不可用",
+                         "无法创建或访问下载目录:\n" + downloadDirectory);
+    return;
+  }
+  downloadCurrentFileFromUrl(*item, {});
+}
+
+void MainWindow::downloadCurrentFileFromUrl(const FileItem& item,
+                                            const QUrl& url) {
+  const QString downloadDirectory = downloadPathEdit_->text().trimmed();
+  const QString targetPath =
+      QDir(downloadDirectory).filePath(item.entry.name);
+  if (QFileInfo::exists(targetPath) &&
+      QMessageBox::question(this, "覆盖本地文件",
+                            "本地已存在同名文件，是否覆盖？\n" +
+                                QDir::toNativeSeparators(targetPath)) !=
+          QMessageBox::Yes) {
+    return;
+  }
+
+  downloadInProgress_ = true;
+  updateModeControls();
+  setOperationStatus("正在下载: " + item.entry.name);
+  Q_UNUSED(url);
+  fetchFileData(item, [this, targetPath, fileName = item.entry.name](
+                          bool ok, const QString& message,
+                          const QByteArray& data) {
+    downloadInProgress_ = false;
+    updateModeControls();
+    if (!ok) {
+      setOperationStatus("下载失败: " + fileName);
+      QMessageBox::warning(this, "下载失败", message);
+      return;
+    }
+
+    QSaveFile file(targetPath);
+    if (!file.open(QIODevice::WriteOnly)) {
+      setOperationStatus("下载保存失败: " + fileName);
+      QMessageBox::warning(this, "保存失败", file.errorString());
+      return;
+    }
+    file.write(data);
+    if (!file.commit()) {
+      setOperationStatus("下载保存失败: " + fileName);
+      QMessageBox::warning(this, "保存失败", file.errorString());
+      return;
+    }
+
+    setOperationStatus("已下载: " + QDir::toNativeSeparators(targetPath));
+  });
+}
+
+void MainWindow::fetchFileData(const FileItem& item,
+                               OpenListClient::DownloadCallback callback) {
+  QByteArray cachedData;
+  if (PreviewCache::loadRawData(item.entry, &cachedData)) {
+    callback(true, "cached", cachedData);
+    return;
+  }
+
+  if (!item.entry.rawUrl.isEmpty()) {
+    fetchFileDataFromUrl(item.entry,
+                         resolvedOpenListUrl(client_.baseUrl(), item.entry.rawUrl),
+                         callback);
+    return;
+  }
+
+  const QString expectedPath = item.entry.path;
+  setOperationStatus("正在获取下载地址: " + item.entry.name);
+  client_.getFileInfo(
+      expectedPath,
+      [this, item, expectedPath, callback](bool ok, const QString& message,
+                                           const RemoteEntry& entry) {
+        if (!ok || entry.rawUrl.isEmpty()) {
+          callback(false, ok ? "OpenList 没有返回下载地址。" : message, {});
+          return;
+        }
+        RemoteEntry cacheEntry = item.entry;
+        cacheEntry.rawUrl = entry.rawUrl;
+        cacheEntry.thumb = entry.thumb;
+        fetchFileDataFromUrl(
+            cacheEntry, resolvedOpenListUrl(client_.baseUrl(), entry.rawUrl),
+            callback);
+      });
+}
+
+void MainWindow::fetchFileDataFromUrl(
+    const RemoteEntry& entry,
+    const QUrl& url,
+    OpenListClient::DownloadCallback callback) {
+  if (!url.isValid()) {
+    callback(false, "文件下载地址无效。", {});
+    return;
+  }
+
+  client_.downloadUrl(url, [entry, callback](bool ok, const QString& message,
+                                             const QByteArray& data) {
+    if (ok) {
+      PreviewCache::storeRawData(entry, data);
+    }
+    callback(ok, message, data);
+  });
+}
+
+void MainWindow::convertCurrentFileOnly() {
+  const FileItem* item = currentFile();
+  if (!item) {
+    QMessageBox::information(this, "没有当前文件", "请先选择一个文件。");
+    return;
+  }
+  if (!isImageFileName(item->entry.name)) {
+    QMessageBox::information(this, "不是图片", "当前文件不是可转换的图片。");
+    return;
+  }
+  if (submitInProgress_ || downloadInProgress_) {
+    return;
+  }
+
+  if (QMessageBox::warning(
+          this, "仅转换当前图片",
+          "此操作会把当前图片转成 WebP 上传回原目录，成功后删除 OpenList 上的原文件。\n\n"
+          "原文件名和原格式不会保留。继续吗？",
+          QMessageBox::Yes | QMessageBox::No, QMessageBox::No) !=
+      QMessageBox::Yes) {
+    return;
+  }
+
+  const int fileIndex = currentIndex_;
+  QStringList targetDirs;
+  targetDirs << parentRemotePath(item->entry.path);
+  submitInProgress_ = true;
+  updateModeControls();
+  submitConvertedImage(
+      fileIndex, targetDirs,
+      [this, fileIndex](bool ok, const QString& message) {
+        submitInProgress_ = false;
+        if (fileIndex >= 0 && fileIndex < files_.size()) {
+          FileItem& file = files_[fileIndex];
+          file.submitted = ok;
+          file.failed = !ok;
+          file.lastError = ok ? QString() : message;
+          updateFileListRow(fileIndex);
+          if (fileIndex == currentIndex_) {
+            rebuildTagChecks();
+            if (ok) {
+              showInfoPage("转换完成", escapeHtml(message));
+            } else {
+              renderCurrentFile();
+            }
+          }
+          refreshStats();
+        }
+        updateModeControls();
+        setOperationStatus(ok ? message : "转换失败: " + message);
+        if (!ok) {
+          QMessageBox::warning(this, "转换失败", message);
+        }
+      });
+}
+
 void MainWindow::enterClassificationMode() {
   if (!client_.hasConnection()) {
     QMessageBox::warning(this, "未连接", "请先连接 OpenList。");
@@ -823,6 +1201,7 @@ void MainWindow::exitClassificationMode() {
   classificationMode_ = false;
   files_.clear();
   currentIndex_ = -1;
+  currentPage_ = 0;
   currentPixmap_ = QPixmap();
   rebuildFileList();
   rebuildTagChecks();
@@ -835,6 +1214,7 @@ void MainWindow::exitClassificationMode() {
 void MainWindow::loadSourceDirectory() {
   files_.clear();
   currentIndex_ = -1;
+  currentPage_ = 0;
   rebuildFileList();
   rebuildTagChecks();
   refreshStats();
@@ -888,19 +1268,22 @@ void MainWindow::setCurrentIndex(int index) {
   if (index < 0 || index >= files_.size()) {
     return;
   }
+  ensurePageForIndex(index);
   currentIndex_ = index;
-  if (fileList_->currentRow() != currentIndex_) {
-    fileList_->setCurrentRow(currentIndex_);
+  const int row = currentIndex_ - pageStartIndex();
+  if (row >= 0 && row < fileList_->count() && fileList_->currentRow() != row) {
+    fileList_->setCurrentRow(row);
   }
   renderCurrentFile();
   rebuildTagChecks();
   refreshStats();
+  updateModeControls();
 }
 
 void MainWindow::renderCurrentFile() {
   const FileItem* item = currentFile();
   currentPixmap_ = QPixmap();
-  imageLabel_->clear();
+  imageLabel_->clearImage();
   mediaPlayer_->stop();
   mediaPlayer_->setMedia(QMediaContent());
 
@@ -934,6 +1317,7 @@ void MainWindow::renderCurrentFile() {
           }
           if (currentIndex_ >= 0 && currentIndex_ < files_.size()) {
             files_[currentIndex_].entry.rawUrl = entry.rawUrl;
+            files_[currentIndex_].entry.thumb = entry.thumb;
           }
           const FileItem* refreshed = currentFile();
           if (!refreshed) {
@@ -963,12 +1347,16 @@ void MainWindow::renderImage(const FileItem& item, const QString& rawUrl) {
   showInfoPage("正在加载图片", formatEntryInfo(item));
   const QString expectedPath = item.entry.path;
   const QString fileName = item.entry.name;
+  const QString thumbUrl = item.entry.thumb;
   const RemoteEntry cacheEntry = item.entry;
   setOperationStatus("正在准备图片预览: " + fileName);
 
   auto startDownload = [this, expectedPath, fileName, cacheEntry, rawUrl]() {
-    client_.downloadUrl(
-        QUrl(rawUrl),
+    FileItem fetchItem;
+    fetchItem.entry = cacheEntry;
+    fetchItem.entry.rawUrl = rawUrl;
+    fetchFileData(
+        fetchItem,
         [this, expectedPath, fileName, cacheEntry](
             bool ok, const QString& message, const QByteArray& data) {
           if (currentFilePath() != expectedPath) {
@@ -1014,10 +1402,60 @@ void MainWindow::renderImage(const FileItem& item, const QString& rawUrl) {
         });
   };
 
+  auto startThumbnail = [this, expectedPath, fileName, cacheEntry, thumbUrl,
+                         startDownload]() {
+    if (thumbUrl.isEmpty()) {
+      startDownload();
+      return;
+    }
+
+    const QUrl url = resolvedOpenListUrl(client_.baseUrl(), thumbUrl);
+    if (!url.isValid()) {
+      startDownload();
+      return;
+    }
+
+    setOperationStatus("正在加载缩略图预览: " + fileName);
+    client_.downloadUrl(
+        url,
+        [this, expectedPath, fileName, cacheEntry, startDownload](
+            bool ok, const QString&, const QByteArray& data) {
+          if (currentFilePath() != expectedPath) {
+            return;
+          }
+          if (!ok) {
+            startDownload();
+            return;
+          }
+
+          auto* watcher = new QFutureWatcher<ThumbnailLoadResult>(this);
+          QObject::connect(
+              watcher, &QFutureWatcher<ThumbnailLoadResult>::finished, this,
+              [this, watcher, expectedPath, fileName, startDownload]() {
+                const ThumbnailLoadResult thumb = watcher->result();
+                watcher->deleteLater();
+                if (currentFilePath() != expectedPath) {
+                  return;
+                }
+                if (thumb.ok && imageLargeEnoughForPreview(thumb.image)) {
+                  currentPixmap_ = QPixmap::fromImage(thumb.image);
+                  previewTitleLabel_->setText(fileName + " / 缩略图预览");
+                  previewStack_->setCurrentWidget(imagePage_);
+                  setOperationStatus("已从缩略图加载图片预览: " + fileName);
+                  updateImagePreviewScale();
+                  return;
+                }
+                startDownload();
+              });
+          watcher->setFuture(
+              QtConcurrent::run(decodeThumbnailTask, data, fileName, cacheEntry));
+        });
+  };
+
   auto* cacheWatcher = new QFutureWatcher<ImageCacheLoadResult>(this);
   QObject::connect(
       cacheWatcher, &QFutureWatcher<ImageCacheLoadResult>::finished, this,
-      [this, cacheWatcher, expectedPath, fileName, startDownload]() {
+      [this, cacheWatcher, expectedPath, fileName, cacheEntry, startThumbnail]() {
         const ImageCacheLoadResult cached = cacheWatcher->result();
         cacheWatcher->deleteLater();
         if (currentFilePath() != expectedPath) {
@@ -1031,7 +1469,28 @@ void MainWindow::renderImage(const FileItem& item, const QString& rawUrl) {
           updateImagePreviewScale();
           return;
         }
-        startDownload();
+        auto* thumbCacheWatcher = new QFutureWatcher<ThumbnailLoadResult>(this);
+        QObject::connect(
+            thumbCacheWatcher,
+            &QFutureWatcher<ThumbnailLoadResult>::finished, this,
+            [this, thumbCacheWatcher, expectedPath, fileName, startThumbnail]() {
+              const ThumbnailLoadResult thumb = thumbCacheWatcher->result();
+              thumbCacheWatcher->deleteLater();
+              if (currentFilePath() != expectedPath) {
+                return;
+              }
+              if (thumb.ok && imageLargeEnoughForPreview(thumb.image)) {
+                currentPixmap_ = QPixmap::fromImage(thumb.image);
+                previewTitleLabel_->setText(fileName + " / 缓存缩略图");
+                previewStack_->setCurrentWidget(imagePage_);
+                setOperationStatus("已从缓存缩略图加载图片预览: " + fileName);
+                updateImagePreviewScale();
+                return;
+              }
+              startThumbnail();
+            });
+        thumbCacheWatcher->setFuture(
+            QtConcurrent::run(loadCachedThumbnailTask, cacheEntry));
       });
   cacheWatcher->setFuture(QtConcurrent::run(loadCachedImageTask, cacheEntry));
 }
@@ -1039,7 +1498,7 @@ void MainWindow::renderImage(const FileItem& item, const QString& rawUrl) {
 void MainWindow::renderVideo(const FileItem& item, const QString& rawUrl) {
   previewStack_->setCurrentWidget(videoPage_);
   playPauseButton_->setText("播放");
-  mediaPlayer_->setMedia(QUrl(rawUrl));
+  mediaPlayer_->setMedia(resolvedOpenListUrl(client_.baseUrl(), rawUrl));
   mediaPlayer_->pause();
   Q_UNUSED(item);
 }
@@ -1085,37 +1544,144 @@ QString MainWindow::formatEntryInfo(const FileItem& item) const {
       .arg(status);
 }
 
+bool MainWindow::imageLargeEnoughForPreview(const QImage& image) const {
+  if (image.isNull()) {
+    return false;
+  }
+
+  QSize targetSize(720, 420);
+  if (imageLabel_) {
+    targetSize =
+        (imageLabel_->size() - QSize(20, 20)).expandedTo(QSize(480, 320));
+  }
+
+  const bool fitsViewport =
+      image.width() >= targetSize.width() * 0.75 &&
+      image.height() >= targetSize.height() * 0.75;
+  const int longEdge = qMax(image.width(), image.height());
+  const int shortEdge = qMin(image.width(), image.height());
+  return fitsViewport || (longEdge >= 720 && shortEdge >= 360);
+}
+
 void MainWindow::updateImagePreviewScale() {
   if (currentPixmap_.isNull() || !imageLabel_) {
     return;
   }
-  const QSize targetSize =
-      imageLabel_->size().expandedTo(QSize(320, 240)) - QSize(20, 20);
-  imageLabel_->setPixmap(currentPixmap_.scaled(
-      targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+  imageLabel_->setImage(currentPixmap_);
 }
 
 void MainWindow::rebuildFileList() {
+  if (currentPage_ < 0) {
+    currentPage_ = 0;
+  }
+  const int pageCount =
+      files_.isEmpty() ? 0 : (files_.size() + pageSize_ - 1) / pageSize_;
+  if (pageCount > 0 && currentPage_ >= pageCount) {
+    currentPage_ = pageCount - 1;
+  }
+
+  QSignalBlocker blocker(fileList_);
   fileList_->clear();
-  for (int i = 0; i < files_.size(); ++i) {
+  for (int i = pageStartIndex(); i < pageEndIndex(); ++i) {
     const FileItem& item = files_[i];
     auto* row = new QListWidgetItem();
     row->setData(Qt::UserRole, i);
     fileList_->addItem(row);
     updateFileListRow(i);
   }
+  if (currentIndex_ >= pageStartIndex() && currentIndex_ < pageEndIndex()) {
+    fileList_->setCurrentRow(currentIndex_ - pageStartIndex());
+  }
+  refreshFilePageControls();
 }
 
 void MainWindow::updateFileListRow(int index) {
-  if (index < 0 || index >= files_.size() || index >= fileList_->count()) {
+  if (index < pageStartIndex() || index >= pageEndIndex()) {
+    return;
+  }
+  const int rowIndex = index - pageStartIndex();
+  if (index < 0 || index >= files_.size() || rowIndex >= fileList_->count()) {
     return;
   }
   const FileItem& item = files_[index];
   const QString tags =
       item.selectedTags.isEmpty() ? "无 tag" : item.selectedTags.join(", ");
-  QListWidgetItem* row = fileList_->item(index);
-  row->setText(QString("%1  %2\n%3")
+  QListWidgetItem* row = fileList_->item(rowIndex);
+  row->setText(QString("%1. %2  %3\n%4")
+                   .arg(index + 1)
                    .arg(statusTextForFile(item), item.entry.name, tags));
+}
+
+int MainWindow::pageStartIndex() const {
+  if (files_.isEmpty()) {
+    return 0;
+  }
+  return qBound(0, currentPage_ * pageSize_, files_.size());
+}
+
+int MainWindow::pageEndIndex() const {
+  if (files_.isEmpty()) {
+    return 0;
+  }
+  return qMin(files_.size(), pageStartIndex() + pageSize_);
+}
+
+void MainWindow::setCurrentPage(int page) {
+  const int pageCount =
+      files_.isEmpty() ? 0 : (files_.size() + pageSize_ - 1) / pageSize_;
+  if (pageCount <= 0) {
+    currentPage_ = 0;
+    rebuildFileList();
+    return;
+  }
+
+  const int boundedPage = qBound(0, page, pageCount - 1);
+  if (currentPage_ == boundedPage) {
+    refreshFilePageControls();
+    return;
+  }
+
+  currentPage_ = boundedPage;
+  rebuildFileList();
+  if (currentIndex_ < pageStartIndex() || currentIndex_ >= pageEndIndex()) {
+    setCurrentIndex(pageStartIndex());
+  }
+}
+
+void MainWindow::ensurePageForIndex(int index) {
+  if (index < 0 || index >= files_.size()) {
+    return;
+  }
+
+  const int page = index / pageSize_;
+  if (page != currentPage_) {
+    currentPage_ = page;
+    rebuildFileList();
+  }
+}
+
+void MainWindow::refreshFilePageControls() {
+  const int pageCount =
+      files_.isEmpty() ? 0 : (files_.size() + pageSize_ - 1) / pageSize_;
+  if (pageInfoLabel_) {
+    if (pageCount == 0) {
+      pageInfoLabel_->setText("第 0 / 0 页");
+    } else {
+      pageInfoLabel_->setText(
+          QString("第 %1 / %2 页  %3-%4 / %5")
+              .arg(currentPage_ + 1)
+              .arg(pageCount)
+              .arg(pageStartIndex() + 1)
+              .arg(pageEndIndex())
+              .arg(files_.size()));
+    }
+  }
+  if (prevPageButton_) {
+    prevPageButton_->setEnabled(pageCount > 0 && currentPage_ > 0);
+  }
+  if (nextPageButton_) {
+    nextPageButton_->setEnabled(pageCount > 0 && currentPage_ < pageCount - 1);
+  }
 }
 
 void MainWindow::refreshStats() {
@@ -1145,7 +1711,9 @@ void MainWindow::refreshStats() {
 
   prevButton_->setEnabled(currentIndex_ > 0);
   nextButton_->setEnabled(currentIndex_ >= 0 && currentIndex_ < files_.size() - 1);
-  saveButton_->setEnabled(classificationMode_ && pending > 0 && !submitInProgress_);
+  saveButton_->setEnabled(classificationMode_ && pending > 0 &&
+                          !submitInProgress_ && !downloadInProgress_);
+  refreshFilePageControls();
 }
 
 void MainWindow::refreshTagTable() {
@@ -1218,13 +1786,21 @@ void MainWindow::onTagSelectionChanged() {
 
 void MainWindow::updateModeControls() {
   const bool connected = client_.hasConnection();
-  browseSourceButton_->setEnabled(connected && !classificationMode_ && !submitInProgress_);
-  enterModeButton_->setEnabled(connected && !submitInProgress_);
+  const bool busy = submitInProgress_ || downloadInProgress_;
+  browseSourceButton_->setEnabled(connected && !classificationMode_ && !busy);
+  browseDownloadPathButton_->setEnabled(!busy);
+  downloadCurrentButton_->setEnabled(connected && currentFile() && !busy);
+  convertCurrentButton_->setEnabled(connected && currentFile() &&
+                                    isImageFileName(currentFile()->entry.name) &&
+                                    !busy);
+  enterModeButton_->setEnabled(connected && !busy);
   enterModeButton_->setText(classificationMode_ ? "退出分类模式" : "进入分类模式");
   sourcePathEdit_->setEnabled(!classificationMode_);
-  addTagButton_->setEnabled(!submitInProgress_);
-  editTagButton_->setEnabled(!submitInProgress_);
-  removeTagButton_->setEnabled(!submitInProgress_);
+  downloadPathEdit_->setEnabled(!busy);
+  convertImageMoveCheck_->setEnabled(!busy);
+  addTagButton_->setEnabled(!busy);
+  editTagButton_->setEnabled(!busy);
+  removeTagButton_->setEnabled(!busy);
   updateEndpointStatus();
   refreshStats();
 }
@@ -1374,10 +1950,15 @@ QString MainWindow::targetPathForTag(const QString& tagName) const {
 void MainWindow::savePending() {
   QVector<int> pendingIndexes;
   bool hasMultiTag = false;
+  int convertedImageMoveCount = 0;
   for (int i = 0; i < files_.size(); ++i) {
     if (!files_[i].submitted && !files_[i].selectedTags.isEmpty()) {
       pendingIndexes.push_back(i);
       hasMultiTag = hasMultiTag || files_[i].selectedTags.size() > 1;
+      if (convertImageMoveCheck_->isChecked() &&
+          isImageFileName(files_[i].entry.name)) {
+        ++convertedImageMoveCount;
+      }
     }
   }
   if (pendingIndexes.isEmpty()) {
@@ -1386,8 +1967,23 @@ void MainWindow::savePending() {
   }
   if (hasMultiTag &&
       QMessageBox::question(this, "多 tag 复制提示",
-                            "有文件选择了多个 tag，保存时会复制到多个目标目录，原文件会保留在源目录。继续吗？") !=
+                            convertImageMoveCheck_->isChecked()
+                                ? "有文件选择了多个 tag。图片会转成 WebP 上传到多个目标目录并删除源文件；非图片仍会复制到多个目标目录并保留源文件。继续吗？"
+                                : "有文件选择了多个 tag，保存时会复制到多个目标目录，原文件会保留在源目录。继续吗？") !=
           QMessageBox::Yes) {
+    return;
+  }
+  if (convertedImageMoveCount > 0 &&
+      QMessageBox::warning(
+          this, "图片转 WebP 后保存",
+          QString("已启用“保存时转 WebP”。\n\n"
+                  "本次有 %1 个图片不会直接移动或复制原文件；程序会下载原图，"
+                  "按原文件 SHA-256 转成 WebP 上传到已选择的目标目录，然后删除 OpenList "
+                  "源目录中的原文件。\n\n"
+                  "原文件名和原格式不会保留。继续吗？")
+              .arg(convertedImageMoveCount),
+          QMessageBox::Yes | QMessageBox::No,
+          QMessageBox::No) != QMessageBox::Yes) {
     return;
   }
 
@@ -1463,14 +2059,177 @@ void MainWindow::submitFile(int index,
     }
   }
 
+  QStringList targetDirs;
+  for (const QString& tagName : file.selectedTags) {
+    const QString targetPath = targetPathForTag(tagName);
+    if (!targetDirs.contains(targetPath)) {
+      targetDirs.push_back(targetPath);
+    }
+  }
+
+  if (convertImageMoveCheck_->isChecked() &&
+      isImageFileName(file.entry.name)) {
+    submitConvertedImage(index, targetDirs, callback);
+    return;
+  }
+
   if (file.selectedTags.size() == 1) {
     client_.moveFile(sourcePath_, file.entry.name,
-                     targetPathForTag(file.selectedTags.first()),
+                     targetDirs.first(),
                      overwriteCheck_->isChecked(), callback);
     return;
   }
 
   submitCopyTargets(index, file.selectedTags, 0, callback);
+}
+
+void MainWindow::submitConvertedImage(
+    int index,
+    const QStringList& targetDirs,
+    OpenListClient::SimpleCallback callback) {
+  if (index < 0 || index >= files_.size()) {
+    callback(false, "内部索引错误");
+    return;
+  }
+  if (targetDirs.isEmpty()) {
+    callback(false, "没有可上传的目标目录");
+    return;
+  }
+
+  const FileItem file = files_[index];
+  setOperationStatus("正在准备待转换图片: " + file.entry.name);
+  fetchFileData(
+      file,
+      [this, index, file, targetDirs, callback](
+          bool ok, const QString& message, const QByteArray& data) {
+        if (!ok) {
+          callback(false, "获取待转换图片失败: " + message);
+          return;
+        }
+
+        setOperationStatus("正在转 WebP: " + file.entry.name);
+        auto* watcher = new QFutureWatcher<ImageConversionResult>(this);
+        QObject::connect(
+            watcher, &QFutureWatcher<ImageConversionResult>::finished, this,
+            [this, watcher, index, targetDirs, callback]() {
+              const ImageConversionResult converted = watcher->result();
+              watcher->deleteLater();
+              if (!converted.ok) {
+                callback(false, converted.message);
+                return;
+              }
+
+              uploadConvertedImageTargets(index, converted, targetDirs, 0,
+                                          callback);
+            });
+        watcher->setFuture(QtConcurrent::run(convertImageToWebpTask, data,
+                                             file.entry.name, file.entry));
+      });
+}
+
+void MainWindow::uploadConvertedImageTargets(
+    int index,
+    const ImageConversionResult& converted,
+    const QStringList& targetDirs,
+    int targetPosition,
+    OpenListClient::SimpleCallback callback) {
+  if (targetPosition >= targetDirs.size()) {
+    removeSubmittedSourceFile(
+        index,
+        QString("已转 WebP 并处理 %1 个目标目录: %2（SHA-256 来源：%3）")
+            .arg(targetDirs.size())
+            .arg(converted.outputName)
+            .arg(converted.hashSource),
+        callback);
+    return;
+  }
+
+  const QString targetDir = targetDirs[targetPosition];
+  setOperationStatus(
+      QString("正在检查目标目录 %1 / %2: %3")
+          .arg(targetPosition + 1)
+          .arg(targetDirs.size())
+          .arg(targetDir));
+
+  client_.listDirectory(
+      targetDir, false,
+      [this, index, converted, targetDirs, targetPosition, callback](
+          bool ok, const QString& message, const QString&,
+          const QVector<RemoteEntry>& entries) {
+        if (!ok) {
+          callback(false, "检查目标目录失败: " + message);
+          return;
+        }
+
+        bool duplicateExists = false;
+        for (const RemoteEntry& entry : entries) {
+          if (entry.isDir || lowerSuffix(entry.name) != "webp") {
+            continue;
+          }
+          if (index >= 0 && index < files_.size() &&
+              entry.path == files_[index].entry.path) {
+            continue;
+          }
+          const QString baseName = QFileInfo(entry.name).completeBaseName();
+          if (baseName == converted.sha256 || baseName == converted.md5) {
+            duplicateExists = true;
+            break;
+          }
+        }
+
+        if (duplicateExists) {
+          uploadConvertedImageTargets(index, converted, targetDirs,
+                                      targetPosition + 1, callback);
+          return;
+        }
+
+        const QString uploadPath =
+            joinRemotePath(targetDirs[targetPosition], converted.outputName);
+        if (index >= 0 && index < files_.size() &&
+            normalizeRemotePath(uploadPath) == normalizeRemotePath(files_[index].entry.path)) {
+          callback(false, "当前文件已经是目标 WebP 文件，无需转换。");
+          return;
+        }
+        setOperationStatus(
+            QString("正在上传 WebP %1 / %2: %3")
+                .arg(targetPosition + 1)
+                .arg(targetDirs.size())
+                .arg(converted.outputName));
+        client_.uploadFile(
+            uploadPath, converted.data, overwriteCheck_->isChecked(),
+            [this, index, converted, targetDirs, targetPosition, callback](
+                bool ok, const QString& message) {
+              if (!ok) {
+                callback(false, "上传 WebP 失败: " + message);
+                return;
+              }
+              uploadConvertedImageTargets(index, converted, targetDirs,
+                                          targetPosition + 1, callback);
+            });
+      });
+}
+
+void MainWindow::removeSubmittedSourceFile(
+    int index,
+    const QString& successMessage,
+    OpenListClient::SimpleCallback callback) {
+  if (index < 0 || index >= files_.size()) {
+    callback(false, "内部索引错误");
+    return;
+  }
+
+  const RemoteEntry entry = files_[index].entry;
+  setOperationStatus("正在删除源文件: " + entry.name);
+  client_.removeFile(parentRemotePath(entry.path), entry.name,
+                     [callback, successMessage](bool ok,
+                                                const QString& message) {
+                       if (!ok) {
+                         callback(false,
+                                  "转换上传已完成，但删除源文件失败: " + message);
+                         return;
+                       }
+                       callback(true, successMessage);
+                     });
 }
 
 void MainWindow::submitCopyTargets(int fileIndex,

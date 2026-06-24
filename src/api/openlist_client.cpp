@@ -186,6 +186,60 @@ void OpenListClient::downloadUrl(const QUrl& url, DownloadCallback callback) {
                    });
 }
 
+void OpenListClient::uploadFile(const QString& remotePath,
+                                const QByteArray& data,
+                                bool overwrite,
+                                SimpleCallback callback) {
+  const QString normalizedPath = normalizeRemotePath(remotePath);
+  QNetworkRequest request = makeRequest("/api/fs/put");
+  request.setHeader(QNetworkRequest::ContentTypeHeader,
+                    "application/octet-stream");
+  request.setRawHeader("File-Path",
+                       QUrl::toPercentEncoding(normalizedPath));
+  request.setRawHeader("As-Task", "false");
+  request.setRawHeader("Overwrite", overwrite ? "true" : "false");
+
+  QNetworkReply* reply = network_.put(request, data);
+  QObject::connect(reply, &QNetworkReply::finished, this,
+                   [reply, callback]() {
+                     const QByteArray payload = reply->readAll();
+                     if (reply->error() != QNetworkReply::NoError) {
+                       const QString message = reply->errorString();
+                       reply->deleteLater();
+                       callback(false, message);
+                       return;
+                     }
+
+                     bool ok = false;
+                     QString message;
+                     QJsonObject dataObject;
+                     parseApiResponse(payload, &ok, &message, &dataObject);
+                     reply->deleteLater();
+                     callback(ok, message);
+                   });
+}
+
+void OpenListClient::removeFile(const QString& dir,
+                                const QString& fileName,
+                                SimpleCallback callback) {
+  QJsonObject payload;
+  payload.insert("dir", normalizeRemotePath(dir));
+
+  QJsonArray names;
+  names.append(fileName);
+  payload.insert("names", names);
+
+  postJson("/api/fs/remove", payload,
+           [callback](bool ok, const QString& message, const QJsonObject& data) {
+             QString finalMessage = message;
+             const QString dataMessage = data.value("message").toString();
+             if (!dataMessage.isEmpty()) {
+               finalMessage = dataMessage;
+             }
+             callback(ok, finalMessage);
+           });
+}
+
 void OpenListClient::moveFile(const QString& srcDir,
                               const QString& fileName,
                               const QString& dstDir,

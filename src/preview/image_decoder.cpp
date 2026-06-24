@@ -1,39 +1,17 @@
 #include "preview/image_decoder.h"
 
 #include <QBuffer>
-#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QImage>
 #include <QImageReader>
-#include <QProcess>
-#include <QStandardPaths>
-#include <QTemporaryDir>
+
+#include "preview/ffmpeg_image_decoder.h"
+#include "preview/magick_wand_bridge.h"
 
 namespace {
-
-QString findExecutableWithFallback(const QString& executableName,
-                                   const QStringList& fallbackPaths) {
-  const QString appDirPath =
-      QDir(QCoreApplication::applicationDirPath()).filePath(executableName);
-  if (QFileInfo::exists(appDirPath)) {
-    return appDirPath;
-  }
-
-  const QString pathExecutable = QStandardPaths::findExecutable(executableName);
-  if (!pathExecutable.isEmpty()) {
-    return pathExecutable;
-  }
-
-  for (const QString& fallbackPath : fallbackPaths) {
-    if (QFileInfo::exists(fallbackPath)) {
-      return fallbackPath;
-    }
-  }
-  return {};
-}
 
 QString cleanSuffix(const QString& sourceName) {
   QString suffix = QFileInfo(sourceName).suffix().toLower();
@@ -114,6 +92,29 @@ QString imageSignatureSummary(const QByteArray& data,
   return parts.join(", ");
 }
 
+bool shouldCompareContainerDecoders(const QByteArray& data,
+                                    const QString& sourceName) {
+  const QString suffix = detectedSuffixForData(data, sourceName);
+  return suffix == "heic" || suffix == "heif" || suffix == "avif";
+}
+
+qint64 imageArea(const QImage& image) {
+  if (image.isNull()) {
+    return 0;
+  }
+  return static_cast<qint64>(image.width()) * image.height();
+}
+
+void keepLargerImage(ImageDecodeResult* best,
+                     const ImageDecodeResult& candidate) {
+  if (!candidate.ok) {
+    return;
+  }
+  if (!best->ok || imageArea(candidate.image) > imageArea(best->image)) {
+    *best = candidate;
+  }
+}
+
 QString safeDiagnosticName(const QString& sourceName, const QString& suffix) {
   QString baseName = QFileInfo(sourceName).completeBaseName();
   if (baseName.isEmpty()) {
@@ -171,148 +172,57 @@ ImageDecodeResult decodeWithQt(const QByteArray& data,
 ImageDecodeResult decodeWithImageMagick(const QByteArray& data,
                                         const QString& sourceName,
                                         const QString& qtError) {
-  const QString magickPath = findExecutableWithFallback(
-      "magick.exe", {"D:/env/ImageMagick-7.1.1-Q16-HDRI/magick.exe",
-                     "D:/env/ImageMagick-7.1.1-Q16-HDRI/magick"});
-  if (magickPath.isEmpty()) {
+  Q_UNUSED(sourceName);
+
+  QByteArray pngData;
+  QString errorMessage;
+  if (!MagickWandBridge::decodeToPng(data, &pngData, &errorMessage)) {
     return {false,
             {},
-            "Qt 无法解码该图片，且未找到 ImageMagick magick.exe。Qt 错误: " +
-                qtError,
-            "ImageMagick"};
-  }
-
-  QTemporaryDir tempDir(QDir::tempPath() + "/openlist-sorter-image-XXXXXX");
-  if (!tempDir.isValid()) {
-    return {false, {}, "无法创建临时目录用于图片转码。", "ImageMagick"};
-  }
-
-  const QString suffix = detectedSuffixForData(data, sourceName);
-  const QString inputPath = tempDir.filePath("input." + suffix);
-  const QString outputPath = tempDir.filePath("output.png");
-
-  QFile inputFile(inputPath);
-  if (!inputFile.open(QIODevice::WriteOnly)) {
-    return {false, {}, "无法写入临时图片文件: " + inputFile.errorString(),
-            "ImageMagick"};
-  }
-  inputFile.write(data);
-  inputFile.close();
-
-  QProcess process;
-  process.setProgram(magickPath);
-  process.setArguments({inputPath, "PNG32:" + outputPath});
-  process.start();
-  if (!process.waitForStarted(3000)) {
-    return {false, {}, "ImageMagick 启动失败。", "ImageMagick"};
-  }
-  if (!process.waitForFinished(30000)) {
-    process.kill();
-    process.waitForFinished(1000);
-    return {false, {}, "ImageMagick 转码超时。", "ImageMagick"};
-  }
-  if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-    const QString stderrText = QString::fromLocal8Bit(process.readAllStandardError());
-    return {false,
-            {},
-            "ImageMagick 转码失败: " + stderrText.trimmed() +
+            "MagickWand DLL 转码失败: " + errorMessage +
                 "。Qt 错误: " + qtError,
-            "ImageMagick"};
+            "MagickWand DLL"};
   }
 
-  QImage image;
-  if (!image.load(outputPath)) {
-    return {false, {}, "ImageMagick 已输出 PNG，但 Qt 无法读取结果。", "ImageMagick"};
+  QImage image = QImage::fromData(pngData, "PNG");
+  if (image.isNull()) {
+    return {false, {}, "MagickWand 已输出 PNG，但 Qt 无法读取结果。",
+            "MagickWand DLL"};
   }
 
-  return {true, image, "ImageMagick 临时转码", "ImageMagick"};
-}
-
-ImageDecodeResult decodeWithFfmpeg(const QByteArray& data,
-                                   const QString& sourceName,
-                                   const QString& qtError,
-                                   const QString& imageMagickError) {
-  const QString ffmpegPath = findExecutableWithFallback(
-      "ffmpeg.exe", {"D:/env/ffmpeg/bin/ffmpeg.exe"});
-  if (ffmpegPath.isEmpty()) {
-    return {false,
-            {},
-            "Qt 和 ImageMagick 都无法解码该图片，且未找到 ffmpeg.exe。Qt 错误: " +
-                qtError + "。ImageMagick 错误: " + imageMagickError,
-            "ffmpeg"};
-  }
-
-  QTemporaryDir tempDir(QDir::tempPath() + "/openlist-sorter-image-XXXXXX");
-  if (!tempDir.isValid()) {
-    return {false, {}, "无法创建临时目录用于 ffmpeg 图片转码。", "ffmpeg"};
-  }
-
-  const QString suffix = detectedSuffixForData(data, sourceName);
-  const QString inputPath = tempDir.filePath("input." + suffix);
-  const QString outputPath = tempDir.filePath("output.png");
-
-  QFile inputFile(inputPath);
-  if (!inputFile.open(QIODevice::WriteOnly)) {
-    return {false, {}, "无法写入临时图片文件: " + inputFile.errorString(),
-            "ffmpeg"};
-  }
-  inputFile.write(data);
-  inputFile.close();
-
-  QProcess process;
-  process.setProgram(ffmpegPath);
-  process.setArguments({"-hide_banner",
-                        "-loglevel",
-                        "error",
-                        "-y",
-                        "-i",
-                        inputPath,
-                        "-frames:v",
-                        "1",
-                        outputPath});
-  process.start();
-  if (!process.waitForStarted(3000)) {
-    return {false, {}, "ffmpeg 启动失败。", "ffmpeg"};
-  }
-  if (!process.waitForFinished(30000)) {
-    process.kill();
-    process.waitForFinished(1000);
-    return {false, {}, "ffmpeg 转码超时。", "ffmpeg"};
-  }
-  if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-    const QString stderrText =
-        QString::fromLocal8Bit(process.readAllStandardError()).trimmed();
-    return {false,
-            {},
-            "ffmpeg 转码失败: " + stderrText + "。Qt 错误: " + qtError +
-                "。ImageMagick 错误: " + imageMagickError,
-            "ffmpeg"};
-  }
-
-  QImage image;
-  if (!image.load(outputPath)) {
-    return {false, {}, "ffmpeg 已输出 PNG，但 Qt 无法读取结果。", "ffmpeg"};
-  }
-
-  return {true, image, "ffmpeg 临时转码", "ffmpeg"};
+  return {true, image, "MagickWand DLL 内存转码", "MagickWand DLL"};
 }
 
 }  // namespace
 
 ImageDecodeResult ImageDecoder::decodeToImage(const QByteArray& data,
                                               const QString& sourceName) {
+  const bool compareContainerDecoders =
+      shouldCompareContainerDecoders(data, sourceName);
+
   ImageDecodeResult qtResult = decodeWithQt(data, sourceName);
-  if (qtResult.ok) {
+  if (qtResult.ok && !compareContainerDecoders) {
     return qtResult;
   }
+
+  ImageDecodeResult bestResult;
+  keepLargerImage(&bestResult, qtResult);
+
   ImageDecodeResult imageMagickResult =
       decodeWithImageMagick(data, sourceName, qtResult.message);
-  if (imageMagickResult.ok) {
+  if (imageMagickResult.ok && !compareContainerDecoders) {
     return imageMagickResult;
   }
+  keepLargerImage(&bestResult, imageMagickResult);
+
   ImageDecodeResult ffmpegResult =
-      decodeWithFfmpeg(data, sourceName, qtResult.message,
-                       imageMagickResult.message);
+      FfmpegImageDecoder::decodeToImage(data, sourceName, qtResult.message,
+                                        imageMagickResult.message);
+  keepLargerImage(&bestResult, ffmpegResult);
+  if (bestResult.ok) {
+    return bestResult;
+  }
+
   if (!ffmpegResult.ok) {
     const QString diagnosticPath = writeDiagnosticCopy(data, sourceName);
     ffmpegResult.message += "。文件识别: " +
