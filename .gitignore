@@ -2,6 +2,7 @@ build/
 build-*/
 dist/
 tmp/
+cache/
 
 .cache/
 cmake-build-*/
@@ -19,4 +20,3 @@ compile_commands.json
 Thumbs.db
 *.swp
 *.swo
-

@@ -31,7 +31,11 @@ cmake --build build-qt --target openlist_sorter -j 4
 
 程序会先使用 Qt5 自带图片解码和 imageformats 插件预览图片。如果 Qt 无法直接读取 HEIC、AVIF、RAW 等格式，会尝试调用本机 `magick.exe` 临时转码为 PNG 后显示。
 
-本机已经安装 ImageMagick 时通常不需要额外配置；如果没有安装，少见图片格式会退回文件信息页，分类和保存功能不受影响。
+如果 ImageMagick 也无法处理，例如遇到扩展名和真实容器不一致、或 HEIC/HEIF 元数据结构异常的图片，程序会再尝试调用 `ffmpeg.exe` 转出主图 PNG。对于 HEIC grid/tile 图片，这通常能得到完整拼合后的图像。
+
+本机已经安装 ImageMagick / FFmpeg 时通常不需要额外配置；如果都不可用，少见图片格式会退回文件信息页，分类和保存功能不受影响。
+
+图片预览会缓存到程序运行目录下的 `cache/previews`。缓存 key 包含远程路径、大小和修改时间，因此同一个文件再次查看时会直接读取 PNG 缓存，远程文件变化后会自动生成新的缓存。
 
 ## HTTPS / TLS
 

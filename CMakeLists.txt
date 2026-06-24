@@ -16,13 +16,14 @@ set(CMAKE_AUTORCC ON)
 
 set(OPENLIST_SORTER_QT_ROOT "" CACHE PATH "Optional Qt5 installation prefix")
 set(OPENLIST_SORTER_OPENSSL_ROOT "" CACHE PATH "Optional OpenSSL runtime prefix or bin directory")
+set(OPENLIST_SORTER_FFMPEG_ROOT "" CACHE PATH "Optional FFmpeg runtime prefix or bin directory")
 set(OPENLIST_SORTER_DIST_DIR "${CMAKE_BINARY_DIR}/dist" CACHE PATH "Directory for distributable output")
 
 if(OPENLIST_SORTER_QT_ROOT)
   list(PREPEND CMAKE_PREFIX_PATH "${OPENLIST_SORTER_QT_ROOT}")
 endif()
 
-find_package(Qt5 REQUIRED COMPONENTS Widgets Network Multimedia MultimediaWidgets Svg)
+find_package(Qt5 REQUIRED COMPONENTS Widgets Network Multimedia MultimediaWidgets Svg Concurrent)
 
 add_executable(openlist_sorter
   src/app/main.cpp
@@ -33,6 +34,8 @@ add_executable(openlist_sorter
   src/core/models.h
   src/preview/image_decoder.cpp
   src/preview/image_decoder.h
+  src/preview/preview_cache.cpp
+  src/preview/preview_cache.h
   src/ui/connection_dialog.cpp
   src/ui/connection_dialog.h
   src/ui/connection_info_dialog.cpp
@@ -69,6 +72,7 @@ target_link_libraries(openlist_sorter PRIVATE
   Qt5::Multimedia
   Qt5::MultimediaWidgets
   Qt5::Svg
+  Qt5::Concurrent
 )
 
 set(OPENLIST_SORTER_QT_CONF "${CMAKE_CURRENT_BINARY_DIR}/qt.conf")
@@ -124,6 +128,18 @@ if(WIN32)
     endif()
   endforeach()
 
+  foreach(qt_runtime_dll IN ITEMS Qt5Concurrent.dll)
+    if(EXISTS "${OPENLIST_SORTER_QT_ROOT}/bin/${qt_runtime_dll}")
+      add_custom_command(TARGET openlist_sorter POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${OPENLIST_SORTER_QT_ROOT}/bin/${qt_runtime_dll}"
+                "$<TARGET_FILE_DIR:openlist_sorter>/${qt_runtime_dll}"
+        COMMENT "Deploying ${qt_runtime_dll}"
+        VERBATIM
+      )
+    endif()
+  endforeach()
+
   set(OPENLIST_SORTER_OPENSSL_HINTS
     "${OPENLIST_SORTER_OPENSSL_ROOT}"
     "${OPENLIST_SORTER_OPENSSL_ROOT}/bin"
@@ -154,6 +170,24 @@ if(WIN32)
     )
   else()
     message(WARNING "OpenSSL runtime DLLs were not found; HTTPS requests may fail with TLS initialization failed.")
+  endif()
+
+  find_program(OPENLIST_SORTER_FFMPEG_EXECUTABLE
+    NAMES ffmpeg
+    HINTS
+      "${OPENLIST_SORTER_FFMPEG_ROOT}"
+      "${OPENLIST_SORTER_FFMPEG_ROOT}/bin"
+      "D:/env/ffmpeg/bin"
+    DOC "Optional FFmpeg executable for difficult image preview transcoding"
+  )
+  if(OPENLIST_SORTER_FFMPEG_EXECUTABLE)
+    add_custom_command(TARGET openlist_sorter POST_BUILD
+      COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+              "${OPENLIST_SORTER_FFMPEG_EXECUTABLE}"
+              "$<TARGET_FILE_DIR:openlist_sorter>"
+      COMMENT "Deploying FFmpeg image preview fallback"
+      VERBATIM
+    )
   endif()
 elseif(UNIX AND NOT APPLE)
   set_target_properties(openlist_sorter PROPERTIES

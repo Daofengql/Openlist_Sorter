@@ -2,23 +2,22 @@
 #define OPENLIST_SORTER_PREVIEW_IMAGE_DECODER_H
 
 #include <QByteArray>
-#include <QPixmap>
+#include <QImage>
 #include <QString>
 #include <QStringList>
 
 struct ImageDecodeResult {
   bool ok{};
-  QPixmap pixmap;
+  QImage image;
   QString message;
   QString decoderName;
 };
 
 class ImageDecoder {
  public:
-  static ImageDecodeResult decodeToPixmap(const QByteArray& data,
-                                          const QString& sourceName);
+  static ImageDecodeResult decodeToImage(const QByteArray& data,
+                                         const QString& sourceName);
   static QString supportedFormatsSummary();
 };
 
 #endif
-

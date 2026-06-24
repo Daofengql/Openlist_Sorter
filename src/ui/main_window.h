@@ -49,6 +49,7 @@ class MainWindow : public QMainWindow {
   bool showConnectionDialog(bool initialLaunch = false);
   void showConnectionInfoDialog();
   void showAboutDialog();
+  void clearPreviewCache();
   void clearCurrentSelection();
   void clearAllPendingSelections();
   void setOperationStatus(const QString& message);

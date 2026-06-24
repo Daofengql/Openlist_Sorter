@@ -1,5 +1,6 @@
 #include "ui/remote_directory_dialog.h"
 
+#include <QAbstractScrollArea>
 #include <QHBoxLayout>
 #include <QListWidgetItem>
 #include <QVBoxLayout>
@@ -46,6 +47,10 @@ void RemoteDirectoryDialog::buildUi() {
   directoryList_ = new QListWidget();
   directoryList_->setAlternatingRowColors(true);
   directoryList_->setSelectionMode(QAbstractItemView::SingleSelection);
+  directoryList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  directoryList_->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
+  directoryList_->setTextElideMode(Qt::ElideRight);
+  directoryList_->setWordWrap(false);
   layout->addWidget(directoryList_, 1);
 
   statusLabel_ = new QLabel();

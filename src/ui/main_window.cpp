@@ -2,16 +2,20 @@
 
 #include <functional>
 
+#include <QAbstractScrollArea>
 #include <QAbstractItemView>
 #include <QAction>
 #include <QApplication>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDir>
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGridLayout>
 #include <QGroupBox>
 #include <QHeaderView>
+#include <QFutureWatcher>
+#include <QImage>
 #include <QInputDialog>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -27,8 +31,10 @@
 #include <QTextStream>
 #include <QTimer>
 #include <QVBoxLayout>
+#include <QtConcurrent/QtConcurrent>
 
 #include "preview/image_decoder.h"
+#include "preview/preview_cache.h"
 #include "ui/connection_dialog.h"
 #include "ui/connection_info_dialog.h"
 #include "ui/remote_directory_dialog.h"
@@ -67,6 +73,27 @@ QString typeLabel(const RemoteEntry& entry) {
     return "未知文件";
   }
   return suffix.toUpper() + " 文件";
+}
+
+struct ImageCacheLoadResult {
+  bool ok{};
+  QImage image;
+};
+
+ImageCacheLoadResult loadCachedImageTask(const RemoteEntry& entry) {
+  ImageCacheLoadResult result;
+  result.ok = PreviewCache::loadImage(entry, &result.image);
+  return result;
+}
+
+ImageDecodeResult decodeImageTask(const QByteArray& data,
+                                  const QString& fileName,
+                                  const RemoteEntry& cacheEntry) {
+  ImageDecodeResult result = ImageDecoder::decodeToImage(data, fileName);
+  if (result.ok) {
+    PreviewCache::storeImage(cacheEntry, result.image);
+  }
+  return result;
 }
 
 }  // namespace
@@ -138,6 +165,8 @@ void MainWindow::buildMenuBar() {
   QMenu* editMenu = menuBar()->addMenu("编辑(&E)");
   QAction* clearCurrentAction = editMenu->addAction("清空当前文件选择");
   QAction* clearAllPendingAction = editMenu->addAction("清空全部未提交选择");
+  editMenu->addSeparator();
+  QAction* clearPreviewCacheAction = editMenu->addAction("清理预览缓存...");
 
   QMenu* helpMenu = menuBar()->addMenu("帮助(&H)");
   QAction* aboutAction = helpMenu->addAction("关于 OpenList Sorter");
@@ -152,6 +181,8 @@ void MainWindow::buildMenuBar() {
                    &MainWindow::clearCurrentSelection);
   QObject::connect(clearAllPendingAction, &QAction::triggered, this,
                    &MainWindow::clearAllPendingSelections);
+  QObject::connect(clearPreviewCacheAction, &QAction::triggered, this,
+                   &MainWindow::clearPreviewCache);
   QObject::connect(aboutAction, &QAction::triggered, this,
                    &MainWindow::showAboutDialog);
 }
@@ -208,6 +239,9 @@ QWidget* MainWindow::buildStatsPanel() {
 QWidget* MainWindow::buildFilePanel() {
   auto* panel = new QWidget();
   panel->setObjectName("surface");
+  panel->setMinimumWidth(260);
+  panel->setMaximumWidth(360);
+  panel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
   auto* layout = new QVBoxLayout(panel);
   layout->setContentsMargins(14, 14, 14, 14);
   layout->setSpacing(10);
@@ -217,6 +251,10 @@ QWidget* MainWindow::buildFilePanel() {
   fileList_ = new QListWidget();
   fileList_->setSelectionMode(QAbstractItemView::SingleSelection);
   fileList_->setAlternatingRowColors(true);
+  fileList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  fileList_->setSizeAdjustPolicy(QAbstractScrollArea::AdjustIgnored);
+  fileList_->setTextElideMode(Qt::ElideRight);
+  fileList_->setWordWrap(false);
 
   layout->addWidget(title);
   layout->addWidget(fileList_, 1);
@@ -232,8 +270,12 @@ QWidget* MainWindow::buildPreviewPanel() {
 
   previewTitleLabel_ = new QLabel("预览");
   previewTitleLabel_->setObjectName("sectionTitle");
+  previewTitleLabel_->setMinimumWidth(0);
+  previewTitleLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
   currentPathLabel_ = new QLabel("请选择源目录并进入分类模式");
   currentPathLabel_->setObjectName("pathLabel");
+  currentPathLabel_->setMinimumWidth(0);
+  currentPathLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
   currentPathLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
   currentPathLabel_->setWordWrap(true);
 
@@ -300,6 +342,9 @@ QWidget* MainWindow::buildPreviewPanel() {
 QWidget* MainWindow::buildTagPanel() {
   auto* panel = new QWidget();
   panel->setObjectName("surface");
+  panel->setMinimumWidth(300);
+  panel->setMaximumWidth(390);
+  panel->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
   auto* layout = new QVBoxLayout(panel);
   layout->setContentsMargins(14, 14, 14, 14);
   layout->setSpacing(10);
@@ -308,12 +353,15 @@ QWidget* MainWindow::buildTagPanel() {
   title->setObjectName("sectionTitle");
   tagTable_ = new QTableWidget(0, 2);
   tagTable_->setHorizontalHeaderLabels({"Tag", "目标目录"});
-  tagTable_->horizontalHeader()->setStretchLastSection(true);
+  tagTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+  tagTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
   tagTable_->verticalHeader()->hide();
   tagTable_->setSelectionBehavior(QAbstractItemView::SelectRows);
   tagTable_->setSelectionMode(QAbstractItemView::SingleSelection);
   tagTable_->setEditTriggers(QAbstractItemView::NoEditTriggers);
   tagTable_->setAlternatingRowColors(true);
+  tagTable_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  tagTable_->setTextElideMode(Qt::ElideRight);
   tagTable_->setMinimumHeight(180);
 
   auto* tagButtonRow = new QHBoxLayout();
@@ -332,6 +380,7 @@ QWidget* MainWindow::buildTagPanel() {
   tagCheckLayout_->setSpacing(6);
   tagScrollArea_ = new QScrollArea();
   tagScrollArea_->setWidgetResizable(true);
+  tagScrollArea_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   tagScrollArea_->setWidget(tagCheckContainer_);
   tagScrollArea_->setMinimumHeight(220);
 
@@ -633,6 +682,57 @@ void MainWindow::showAboutDialog() {
       "当前版本侧重连续预览、tag 暂存、批量移动和复制。");
 }
 
+void MainWindow::clearPreviewCache() {
+  const PreviewCacheStats cacheStats = PreviewCache::stats();
+  const QString cachePath =
+      QDir::toNativeSeparators(PreviewCache::cacheDirectoryPath());
+
+  if (cacheStats.fileCount == 0) {
+    setOperationStatus("预览缓存为空");
+    QMessageBox::information(
+        this, "预览缓存为空",
+        "当前没有可清理的预览缓存。\n\n缓存位置:\n" + cachePath);
+    return;
+  }
+
+  QMessageBox confirm(this);
+  confirm.setIcon(QMessageBox::Question);
+  confirm.setWindowTitle("清理预览缓存");
+  confirm.setText("确定要清理预览缓存吗？");
+  confirm.setInformativeText(
+      QString("将删除 %1 个缓存文件，占用 %2。\n"
+              "清理后，图片会在下次预览时重新生成缓存。")
+          .arg(cacheStats.fileCount)
+          .arg(formatBytes(cacheStats.totalBytes)));
+  confirm.setDetailedText("缓存位置:\n" + cachePath);
+  confirm.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+  confirm.setDefaultButton(QMessageBox::No);
+  if (auto* yesButton = confirm.button(QMessageBox::Yes)) {
+    yesButton->setText("清理");
+  }
+  if (auto* noButton = confirm.button(QMessageBox::No)) {
+    noButton->setText("取消");
+  }
+
+  if (confirm.exec() != QMessageBox::Yes) {
+    return;
+  }
+
+  QString errorMessage;
+  if (!PreviewCache::clear(&errorMessage)) {
+    setOperationStatus("清理预览缓存失败");
+    QMessageBox::warning(this, "清理失败", errorMessage);
+    return;
+  }
+
+  const QString clearedText =
+      QString("已清理预览缓存: %1 个文件，%2")
+          .arg(cacheStats.fileCount)
+          .arg(formatBytes(cacheStats.totalBytes));
+  setOperationStatus(clearedText);
+  QMessageBox::information(this, "清理完成", clearedText);
+}
+
 void MainWindow::clearCurrentSelection() {
   FileItem* file = currentFile();
   if (!file || file->submitted) {
@@ -863,39 +963,77 @@ void MainWindow::renderImage(const FileItem& item, const QString& rawUrl) {
   showInfoPage("正在加载图片", formatEntryInfo(item));
   const QString expectedPath = item.entry.path;
   const QString fileName = item.entry.name;
-  client_.downloadUrl(QUrl(rawUrl),
-                      [this, expectedPath, fileName](
-                          bool ok, const QString& message,
-                          const QByteArray& data) {
-                        if (currentFilePath() != expectedPath) {
-                          return;
-                        }
-                        if (!ok) {
-                          showInfoPage("图片预览失败",
-                                       formatEntryInfo(*currentFile()) +
-                                           "<br><br><b>错误：</b>" +
-                                           escapeHtml(message));
-                          return;
-                        }
-                        const ImageDecodeResult decoded =
-                            ImageDecoder::decodeToPixmap(data, fileName);
-                        if (!decoded.ok) {
-                          showInfoPage(
-                              "图片预览失败",
-                              formatEntryInfo(*currentFile()) +
-                                  "<br><br><b>错误：</b>" +
-                                  escapeHtml(decoded.message) +
-                                  "<br><br><b>当前 Qt 支持格式：</b>" +
-                                  escapeHtml(
-                                      ImageDecoder::supportedFormatsSummary()));
-                          return;
-                        }
-                        currentPixmap_ = decoded.pixmap;
-                        previewTitleLabel_->setText(fileName + " / " +
-                                                    decoded.decoderName);
-                        previewStack_->setCurrentWidget(imagePage_);
-                        updateImagePreviewScale();
-                      });
+  const RemoteEntry cacheEntry = item.entry;
+  setOperationStatus("正在准备图片预览: " + fileName);
+
+  auto startDownload = [this, expectedPath, fileName, cacheEntry, rawUrl]() {
+    client_.downloadUrl(
+        QUrl(rawUrl),
+        [this, expectedPath, fileName, cacheEntry](
+            bool ok, const QString& message, const QByteArray& data) {
+          if (currentFilePath() != expectedPath) {
+            return;
+          }
+          if (!ok) {
+            showInfoPage("图片预览失败",
+                         formatEntryInfo(*currentFile()) +
+                             "<br><br><b>错误：</b>" + escapeHtml(message));
+            return;
+          }
+
+          setOperationStatus("正在解码图片预览: " + fileName);
+          auto* watcher = new QFutureWatcher<ImageDecodeResult>(this);
+          QObject::connect(
+              watcher, &QFutureWatcher<ImageDecodeResult>::finished, this,
+              [this, watcher, expectedPath, fileName]() {
+                const ImageDecodeResult decoded = watcher->result();
+                watcher->deleteLater();
+                if (currentFilePath() != expectedPath) {
+                  return;
+                }
+                if (!decoded.ok) {
+                  showInfoPage(
+                      "图片预览失败",
+                      formatEntryInfo(*currentFile()) +
+                          "<br><br><b>错误：</b>" +
+                          escapeHtml(decoded.message) +
+                          "<br><br><b>当前 Qt 支持格式：</b>" +
+                          escapeHtml(ImageDecoder::supportedFormatsSummary()));
+                  return;
+                }
+
+                currentPixmap_ = QPixmap::fromImage(decoded.image);
+                previewTitleLabel_->setText(fileName + " / " +
+                                            decoded.decoderName);
+                previewStack_->setCurrentWidget(imagePage_);
+                setOperationStatus("图片预览已加载: " + fileName);
+                updateImagePreviewScale();
+              });
+          watcher->setFuture(QtConcurrent::run(decodeImageTask, data, fileName,
+                                               cacheEntry));
+        });
+  };
+
+  auto* cacheWatcher = new QFutureWatcher<ImageCacheLoadResult>(this);
+  QObject::connect(
+      cacheWatcher, &QFutureWatcher<ImageCacheLoadResult>::finished, this,
+      [this, cacheWatcher, expectedPath, fileName, startDownload]() {
+        const ImageCacheLoadResult cached = cacheWatcher->result();
+        cacheWatcher->deleteLater();
+        if (currentFilePath() != expectedPath) {
+          return;
+        }
+        if (cached.ok) {
+          currentPixmap_ = QPixmap::fromImage(cached.image);
+          previewTitleLabel_->setText(fileName + " / 缓存预览");
+          previewStack_->setCurrentWidget(imagePage_);
+          setOperationStatus("已从缓存加载图片预览: " + fileName);
+          updateImagePreviewScale();
+          return;
+        }
+        startDownload();
+      });
+  cacheWatcher->setFuture(QtConcurrent::run(loadCachedImageTask, cacheEntry));
 }
 
 void MainWindow::renderVideo(const FileItem& item, const QString& rawUrl) {
@@ -1016,7 +1154,7 @@ void MainWindow::refreshTagTable() {
     tagTable_->setItem(i, 0, new QTableWidgetItem(tags_[i].name));
     tagTable_->setItem(i, 1, new QTableWidgetItem(tags_[i].targetPath));
   }
-  tagTable_->resizeColumnsToContents();
+  tagTable_->resizeColumnToContents(0);
 }
 
 void MainWindow::rebuildTagChecks() {
