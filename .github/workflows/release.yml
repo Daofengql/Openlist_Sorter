@@ -1,0 +1,208 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*"
+
+env:
+  IMAGEMAGICK_WINDOWS_URL: https://imagemagick.org/archive/binaries/ImageMagick-7.1.2-25-Q16-HDRI-x64-dll.exe
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows-amd64:
+    name: Build Windows amd64
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 Qt5 toolchain
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-openssl
+            mingw-w64-x86_64-qt5-base
+            mingw-w64-x86_64-qt5-multimedia
+            mingw-w64-x86_64-qt5-svg
+            mingw-w64-x86_64-qt5-tools
+
+      - name: Prepare ImageMagick runtime
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $installer = Join-Path $env:RUNNER_TEMP 'imagemagick-dll.exe'
+          $runtimeDir = Join-Path $env:GITHUB_WORKSPACE 'third_party/runtime/imagemagick'
+
+          Invoke-WebRequest -Uri $env:IMAGEMAGICK_WINDOWS_URL -OutFile $installer
+
+          if (Test-Path $runtimeDir) {
+            Remove-Item -LiteralPath $runtimeDir -Recurse -Force
+          }
+          New-Item -ItemType Directory -Force -Path $runtimeDir | Out-Null
+
+          $arguments = @(
+            '/VERYSILENT',
+            '/SUPPRESSMSGBOXES',
+            '/NORESTART',
+            '/SP-',
+            "/DIR=`"$runtimeDir`""
+          )
+          $process = Start-Process -FilePath $installer -ArgumentList $arguments -Wait -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "ImageMagick installer failed with exit code $($process.ExitCode)."
+          }
+
+          $requiredFiles = @(
+            'CORE_RL_MagickWand_.dll',
+            'CORE_RL_MagickCore_.dll',
+            'CORE_RL_heif_.dll',
+            'CORE_RL_webp_.dll',
+            'modules/coders/IM_MOD_RL_heic_.dll',
+            'modules/coders/IM_MOD_RL_webp_.dll'
+          )
+          foreach ($file in $requiredFiles) {
+            $path = Join-Path $runtimeDir $file
+            if (-not (Test-Path $path)) {
+              throw "ImageMagick runtime is missing required file: $file"
+            }
+          }
+
+          $dllCount = (Get-ChildItem -Path $runtimeDir -Filter 'CORE_RL_*.dll' -File | Measure-Object).Count
+          $coderCount = (Get-ChildItem -Path (Join-Path $runtimeDir 'modules/coders') -Filter 'IM_MOD_RL_*.dll' -File | Measure-Object).Count
+          Write-Host "Prepared ImageMagick runtime: $dllCount CORE_RL DLLs, $coderCount coder modules."
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENLIST_SORTER_QT_ROOT=/mingw64 \
+            -DOPENLIST_SORTER_OPENSSL_ROOT=/mingw64/bin
+
+      - name: Build
+        run: cmake --build build-release --target openlist_sorter --parallel
+
+      - name: Package
+        run: |
+          package_name="OpenListSorter-windows-amd64"
+          mkdir -p "artifacts/${package_name}"
+          cp -a build-release/dist/. "artifacts/${package_name}/"
+          (cd artifacts && cmake -E tar cfv "${package_name}.zip" --format=zip "${package_name}")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenListSorter-windows-amd64
+          path: artifacts/OpenListSorter-windows-amd64.zip
+          if-no-files-found: error
+
+  build-linux-amd64:
+    name: Build Linux amd64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            cmake \
+            libgl1-mesa-dev \
+            ninja-build \
+            patchelf \
+            python3-pip
+          python3 -m pip install --user aqtinstall
+
+      - name: Install Qt5
+        run: |
+          python3 -m aqt install-qt linux desktop 5.15.2 gcc_64 -O "$RUNNER_TEMP/Qt"
+          echo "QT_ROOT=$RUNNER_TEMP/Qt/5.15.2/gcc_64" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DOPENLIST_SORTER_QT_ROOT="$QT_ROOT"
+
+      - name: Build
+        run: cmake --build build-release --target openlist_sorter --parallel
+
+      - name: Package
+        run: |
+          package_name="OpenListSorter-linux-amd64"
+          package_dir="artifacts/${package_name}"
+          mkdir -p "$package_dir"
+          cp -a build-release/dist/. "$package_dir/"
+          cp -a "$QT_ROOT/lib"/libQt5*.so* "$package_dir/"
+          for plugin_dir in platforms imageformats iconengines mediaservice audio; do
+            if [ -d "$QT_ROOT/plugins/$plugin_dir" ]; then
+              cp -a "$QT_ROOT/plugins/$plugin_dir" "$package_dir/"
+            fi
+          done
+          cat > "$package_dir/OpenListSorter.sh" <<'EOF'
+          #!/usr/bin/env bash
+          set -e
+          app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+          export LD_LIBRARY_PATH="$app_dir:${LD_LIBRARY_PATH:-}"
+          export QT_PLUGIN_PATH="$app_dir"
+          exec "$app_dir/OpenListSorter" "$@"
+          EOF
+          sed -i 's/^          //' "$package_dir/OpenListSorter.sh"
+          chmod +x "$package_dir/OpenListSorter.sh"
+          (cd artifacts && tar -czf "${package_name}.tar.gz" "${package_name}")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenListSorter-linux-amd64
+          path: artifacts/OpenListSorter-linux-amd64.tar.gz
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows-amd64
+      - build-linux-amd64
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          ls -la release-assets
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" release-assets/* --clobber
+          else
+            gh release create "$TAG_NAME" release-assets/* \
+              --title "$TAG_NAME" \
+              --generate-notes
+          fi
