@@ -107,6 +107,24 @@ jobs:
           dist="build-release/dist"
           search_dirs=(/mingw64/bin)
 
+          declare -A source_dlls=()
+          while IFS= read -r source_dll; do
+            source_dlls["$(basename "$source_dll" | tr '[:upper:]' '[:lower:]')"]="$source_dll"
+          done < <(find "${search_dirs[@]}" -maxdepth 1 -type f -iname '*.dll')
+
+          refresh_existing_dlls() {
+            existing_dlls=()
+            while IFS= read -r existing_dll; do
+              existing_dlls["$(basename "$existing_dll" | tr '[:upper:]' '[:lower:]')"]=1
+            done < <(find "$dist" -type f -iname '*.dll')
+          }
+
+          list_scanned_binaries() {
+            find "$dist" \
+              -path "$dist/runtime/imagemagick" -prune -o \
+              -type f \( -iname '*.exe' -o -iname '*.dll' \) -print
+          }
+
           is_known_system_dll() {
             case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
               api-ms-win-*|ext-ms-win-*|advapi32.dll|authz.dll|avrt.dll|bcrypt.dll|cfgmgr32.dll|combase.dll|comctl32.dll|comdlg32.dll|crypt32.dll|cryptui.dll|d3d9.dll|d3d11.dll|dbghelp.dll|dhcpcsvc.dll|dnsapi.dll|dwmapi.dll|dwrite.dll|dxgi.dll|dxva2.dll|evr.dll|gdi32.dll|gdi32full.dll|glu32.dll|hid.dll|imagehlp.dll|imm32.dll|iphlpapi.dll|kernel32.dll|ksuser.dll|mf.dll|mfplat.dll|mfreadwrite.dll|mfuuid.dll|mpr.dll|msdmo.dll|msimg32.dll|msvcrt.dll|netapi32.dll|normaliz.dll|ntdll.dll|ole32.dll|oleacc.dll|oleaut32.dll|olepro32.dll|opengl32.dll|powrprof.dll|propsys.dll|psapi.dll|rpcrt4.dll|secur32.dll|setupapi.dll|shell32.dll|shlwapi.dll|strmiids.dll|user32.dll|userenv.dll|uxtheme.dll|version.dll|winhttp.dll|wininet.dll|winmm.dll|winspool.drv|wlanapi.dll|wmcodecdspuuid.dll|wmvcore.dll|ws2_32.dll|wtsapi32.dll)
@@ -116,71 +134,41 @@ jobs:
             return 1
           }
 
-          find_existing_dependency() {
-            local binary_dir="$1"
-            local dll="$2"
-            for dir in "$binary_dir" "$dist" "$dist/runtime/imagemagick"; do
-              if [ -f "$dir/$dll" ]; then
-                return 0
-              fi
-              if find "$dir" -maxdepth 1 -iname "$dll" -type f -print -quit 2>/dev/null | grep -q .; then
-                return 0
-              fi
-            done
-            return 1
-          }
-
-          find_source_dependency() {
-            local dll="$1"
-            for dir in "${search_dirs[@]}"; do
-              if [ -f "$dir/$dll" ]; then
-                printf '%s\n' "$dir/$dll"
-                return 0
-              fi
-              local match
-              match="$(find "$dir" -maxdepth 1 -iname "$dll" -type f -print -quit 2>/dev/null || true)"
-              if [ -n "$match" ]; then
-                printf '%s\n' "$match"
-                return 0
-              fi
-            done
-            return 1
-          }
-
-          for pass in $(seq 1 20); do
+          for pass in $(seq 1 10); do
+            refresh_existing_dlls
             added=0
             while IFS= read -r binary; do
-              binary_dir="$(dirname "$binary")"
               while IFS= read -r dll; do
                 [ -n "$dll" ] || continue
-                if find_existing_dependency "$binary_dir" "$dll"; then
+                dll_key="$(echo "$dll" | tr '[:upper:]' '[:lower:]')"
+                if [ -n "${existing_dlls[$dll_key]:-}" ]; then
                   continue
                 fi
                 if is_known_system_dll "$dll"; then
                   continue
                 fi
-                src="$(find_source_dependency "$dll" || true)"
-                if [ -n "$src" ]; then
+                if [ -n "${source_dlls[$dll_key]:-}" ]; then
                   echo "Deploying Windows dependency $dll"
-                  cp -f "$src" "$dist/"
+                  cp -f "${source_dlls[$dll_key]}" "$dist/"
                   added=1
                 fi
               done < <(objdump -p "$binary" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
-            done < <(find "$dist" -type f \( -iname '*.exe' -o -iname '*.dll' \))
+            done < <(list_scanned_binaries)
             [ "$added" -eq 0 ] && break
           done
 
+          refresh_existing_dlls
           unresolved=()
           while IFS= read -r binary; do
-            binary_dir="$(dirname "$binary")"
             while IFS= read -r dll; do
               [ -n "$dll" ] || continue
-              if find_existing_dependency "$binary_dir" "$dll" || is_known_system_dll "$dll"; then
+              dll_key="$(echo "$dll" | tr '[:upper:]' '[:lower:]')"
+              if [ -n "${existing_dlls[$dll_key]:-}" ] || is_known_system_dll "$dll"; then
                 continue
               fi
               unresolved+=("$binary -> $dll")
             done < <(objdump -p "$binary" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
-          done < <(find "$dist" -type f \( -iname '*.exe' -o -iname '*.dll' \))
+          done < <(list_scanned_binaries)
 
           if [ "${#unresolved[@]}" -gt 0 ]; then
             printf 'Unresolved Windows runtime dependencies:\n'
@@ -295,9 +283,15 @@ jobs:
             local real
             real="$(readlink -f "$src")"
             mkdir -p "$dest_dir"
-            cp -L "$src" "$dest_dir/$(basename "$src")"
+            local target="$dest_dir/$(basename "$src")"
+            if [ ! -e "$target" ] || [ "$(readlink -f "$target")" != "$real" ]; then
+              cp -L "$src" "$target"
+            fi
             if [ "$(basename "$real")" != "$(basename "$src")" ]; then
-              cp -L "$real" "$dest_dir/$(basename "$real")"
+              local real_target="$dest_dir/$(basename "$real")"
+              if [ ! -e "$real_target" ] || [ "$(readlink -f "$real_target")" != "$real" ]; then
+                cp -L "$real" "$real_target"
+              fi
             fi
           }
 
