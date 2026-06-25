@@ -10,6 +10,7 @@
 #include <QMainWindow>
 #include <QMediaPlayer>
 #include <QPixmap>
+#include <QProgressBar>
 #include <QPushButton>
 #include <QScrollArea>
 #include <QSplitter>
@@ -54,6 +55,7 @@ class MainWindow : public QMainWindow {
   void showConnectionInfoDialog();
   void showAboutDialog();
   void clearPreviewCache();
+  void clearPreviewCacheSilently(const QString& reason);
   void clearCurrentSelection();
   void clearAllPendingSelections();
   void setOperationStatus(const QString& message);
@@ -63,10 +65,12 @@ class MainWindow : public QMainWindow {
   void downloadCurrentFile();
   void downloadCurrentFileFromUrl(const FileItem& item, const QUrl& url);
   void fetchFileData(const FileItem& item,
-                     OpenListClient::DownloadCallback callback);
+                     OpenListClient::DownloadCallback callback,
+                     const QString& progressLabel = QString());
   void fetchFileDataFromUrl(const RemoteEntry& entry,
                             const QUrl& url,
-                            OpenListClient::DownloadCallback callback);
+                            OpenListClient::DownloadCallback callback,
+                            const QString& progressLabel = QString());
   void convertCurrentFileOnly();
   void enterClassificationMode();
   void exitClassificationMode();
@@ -88,6 +92,12 @@ class MainWindow : public QMainWindow {
   void setCurrentPage(int page);
   void ensurePageForIndex(int index);
   void refreshFilePageControls();
+  void preloadCurrentPage();
+  void preloadNextPageItem(int generation, int index);
+  void setProgressVisible(bool visible);
+  void setProgressValue(qint64 bytesReceived,
+                        qint64 bytesTotal,
+                        const QString& label);
   void refreshStats();
   void refreshTagTable();
   void rebuildTagChecks();
@@ -165,6 +175,7 @@ class MainWindow : public QMainWindow {
 
   QLabel* endpointStatusLabel_{};
   QLabel* operationStatusLabel_{};
+  QProgressBar* operationProgressBar_{};
 
   QTableWidget* tagTable_{};
   QPushButton* addTagButton_{};
@@ -181,7 +192,11 @@ class MainWindow : public QMainWindow {
   QVector<FileItem> files_;
   int currentIndex_{-1};
   int currentPage_{};
-  int pageSize_{100};
+  int pageSize_{20};
+  int preloadGeneration_{};
+  bool preloadInProgress_{};
+  QVector<int> preloadQueue_;
+  int preloadQueuePosition_{};
   bool classificationMode_{};
   bool submitInProgress_{};
   bool downloadInProgress_{};

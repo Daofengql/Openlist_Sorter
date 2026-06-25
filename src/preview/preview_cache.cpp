@@ -6,17 +6,21 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QBuffer>
 #include <QSaveFile>
 
 namespace {
 
 QString extensionForVariant(const QString& variant) {
-  return variant == "raw" ? ".bin" : ".png";
+  return variant == "raw" ? ".bin" : ".jpg";
 }
 
 QString cacheVersionForVariant(const QString& variant) {
   if (variant == "preview") {
-    return "preview-decode-v2";
+    return "preview-decode-jpeg-v1";
+  }
+  if (variant == "thumb") {
+    return "thumb-jpeg-v1";
   }
   return "v1";
 }
@@ -101,6 +105,26 @@ bool PreviewCache::clear(QString* errorMessage) {
   return true;
 }
 
+QByteArray PreviewCache::encodePreviewImage(const QImage& image) {
+  if (image.isNull()) {
+    return {};
+  }
+
+  QByteArray data;
+  QBuffer buffer(&data);
+  if (!buffer.open(QIODevice::WriteOnly)) {
+    return {};
+  }
+  QImage imageForJpeg = image;
+  if (imageForJpeg.hasAlphaChannel()) {
+    imageForJpeg = imageForJpeg.convertToFormat(QImage::Format_RGB888);
+  }
+  if (!imageForJpeg.save(&buffer, "JPG", 100)) {
+    return {};
+  }
+  return data;
+}
+
 bool PreviewCache::loadImage(const RemoteEntry& entry,
                              QImage* image,
                              QString* cachePath) {
@@ -148,10 +172,12 @@ bool PreviewCache::storeImage(const RemoteEntry& entry,
   if (!file.open(QIODevice::WriteOnly)) {
     return false;
   }
-  if (!image.save(&file, "PNG")) {
+  const QByteArray encoded = encodePreviewImage(image);
+  if (encoded.isEmpty()) {
     file.cancelWriting();
     return false;
   }
+  file.write(encoded);
   return file.commit();
 }
 
@@ -201,10 +227,12 @@ bool PreviewCache::storeThumbnail(const RemoteEntry& entry,
   if (!file.open(QIODevice::WriteOnly)) {
     return false;
   }
-  if (!image.save(&file, "PNG")) {
+  const QByteArray encoded = encodePreviewImage(image);
+  if (encoded.isEmpty()) {
     file.cancelWriting();
     return false;
   }
+  file.write(encoded);
   return file.commit();
 }
 

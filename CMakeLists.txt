@@ -17,7 +17,6 @@ set(CMAKE_AUTORCC ON)
 set(OPENLIST_SORTER_QT_ROOT "" CACHE PATH "Optional Qt5 installation prefix")
 set(OPENLIST_SORTER_OPENSSL_ROOT "" CACHE PATH "Optional OpenSSL runtime prefix or bin directory")
 set(OPENLIST_SORTER_RUNTIME_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/runtime" CACHE PATH "Project-relative third-party runtime root")
-set(OPENLIST_SORTER_FFMPEG_RUNTIME_DIR "${OPENLIST_SORTER_RUNTIME_ROOT}/ffmpeg" CACHE PATH "FFmpeg DLL runtime directory")
 set(OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR "${OPENLIST_SORTER_RUNTIME_ROOT}/imagemagick" CACHE PATH "ImageMagick DLL runtime directory")
 set(OPENLIST_SORTER_DIST_DIR "${CMAKE_BINARY_DIR}/dist" CACHE PATH "Directory for distributable output")
 
@@ -36,8 +35,8 @@ add_executable(openlist_sorter
   src/core/models.h
   src/core/runtime_paths.cpp
   src/core/runtime_paths.h
-  src/preview/ffmpeg_image_decoder.cpp
-  src/preview/ffmpeg_image_decoder.h
+  src/preview/heif_image_decoder.cpp
+  src/preview/heif_image_decoder.h
   src/preview/image_converter.cpp
   src/preview/image_converter.h
   src/preview/image_decoder.cpp
@@ -83,28 +82,6 @@ target_include_directories(openlist_sorter PRIVATE
 )
 
 target_compile_definitions(openlist_sorter PRIVATE QT_NO_KEYWORDS)
-
-set(OPENLIST_SORTER_FFMPEG_INCLUDE_DIR
-  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/include")
-file(GLOB OPENLIST_SORTER_FFMPEG_RUNTIME_DLLS
-  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/avcodec-*.dll"
-  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/avformat-*.dll"
-  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/avutil-*.dll"
-  "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/swscale-*.dll")
-if(EXISTS "${OPENLIST_SORTER_FFMPEG_INCLUDE_DIR}/libavformat/avformat.h"
-   AND OPENLIST_SORTER_FFMPEG_RUNTIME_DLLS)
-  target_include_directories(openlist_sorter PRIVATE
-    "${OPENLIST_SORTER_FFMPEG_INCLUDE_DIR}"
-  )
-  target_compile_definitions(openlist_sorter PRIVATE
-    OPENLIST_SORTER_HAS_FFMPEG_DLL=1
-  )
-else()
-  target_compile_definitions(openlist_sorter PRIVATE
-    OPENLIST_SORTER_HAS_FFMPEG_DLL=0
-  )
-  message(WARNING "FFmpeg DLL runtime was not found under ${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}; uncommon image fallback will be disabled.")
-endif()
 
 target_link_libraries(openlist_sorter PRIVATE
   Qt5::Widgets
@@ -214,41 +191,12 @@ if(WIN32)
 
   add_custom_command(TARGET openlist_sorter POST_BUILD
     COMMAND "${CMAKE_COMMAND}" -E rm -rf
-            "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg"
-    COMMAND "${CMAKE_COMMAND}" -E rm -rf
             "$<TARGET_FILE_DIR:openlist_sorter>/runtime/imagemagick"
+    COMMAND "${CMAKE_COMMAND}" -E rm -rf
+            "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg"
     COMMENT "Cleaning third-party runtime output"
     VERBATIM
   )
-
-  if(EXISTS "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin")
-    add_custom_command(TARGET openlist_sorter POST_BUILD
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-              "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg"
-      COMMAND "${CMAKE_COMMAND}" -E make_directory
-              "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg/bin"
-      COMMENT "Deploying FFmpeg DLL runtime"
-      VERBATIM
-    )
-    foreach(ffmpeg_dll_pattern IN ITEMS
-        avcodec-*.dll
-        avformat-*.dll
-        avutil-*.dll
-        swresample-*.dll
-        swscale-*.dll)
-      file(GLOB OPENLIST_SORTER_FFMPEG_DEPLOY_DLLS
-        "${OPENLIST_SORTER_FFMPEG_RUNTIME_DIR}/bin/${ffmpeg_dll_pattern}")
-      foreach(ffmpeg_dll IN LISTS OPENLIST_SORTER_FFMPEG_DEPLOY_DLLS)
-        add_custom_command(TARGET openlist_sorter POST_BUILD
-          COMMAND "${CMAKE_COMMAND}" -E copy_if_different
-                  "${ffmpeg_dll}"
-                  "$<TARGET_FILE_DIR:openlist_sorter>/runtime/ffmpeg/bin"
-          COMMENT "Deploying ${ffmpeg_dll_pattern}"
-          VERBATIM
-        )
-      endforeach()
-    endforeach()
-  endif()
 
   if(EXISTS "${OPENLIST_SORTER_IMAGEMAGICK_RUNTIME_DIR}/CORE_RL_MagickWand_.dll")
     add_custom_command(TARGET openlist_sorter POST_BUILD

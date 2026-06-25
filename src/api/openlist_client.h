@@ -24,6 +24,8 @@ class OpenListClient : public QObject {
       std::function<void(bool ok, const QString& message, const RemoteEntry& entry)>;
   using DownloadCallback =
       std::function<void(bool ok, const QString& message, const QByteArray& data)>;
+  using DownloadProgressCallback =
+      std::function<void(qint64 bytesReceived, qint64 bytesTotal)>;
 
   explicit OpenListClient(QObject* parent = nullptr);
 
@@ -45,7 +47,9 @@ class OpenListClient : public QObject {
                      bool refresh,
                      ListCallback callback);
   void getFileInfo(const QString& path, EntryCallback callback);
-  void downloadUrl(const QUrl& url, DownloadCallback callback);
+  void downloadUrl(const QUrl& url,
+                   DownloadCallback callback,
+                   DownloadProgressCallback progressCallback = {});
   void uploadFile(const QString& remotePath,
                   const QByteArray& data,
                   bool overwrite,

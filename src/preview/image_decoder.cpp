@@ -8,7 +8,7 @@
 #include <QImage>
 #include <QImageReader>
 
-#include "preview/ffmpeg_image_decoder.h"
+#include "preview/heif_image_decoder.h"
 #include "preview/magick_wand_bridge.h"
 
 namespace {
@@ -208,6 +208,17 @@ ImageDecodeResult ImageDecoder::decodeToImage(const QByteArray& data,
   ImageDecodeResult bestResult;
   keepLargerImage(&bestResult, qtResult);
 
+  ImageDecodeResult heifResult;
+  if (compareContainerDecoders) {
+    heifResult =
+        HeifImageDecoder::decodeToImage(data, sourceName, qtResult.message,
+                                        "已优先使用 libheif，跳过 MagickWand。");
+    keepLargerImage(&bestResult, heifResult);
+    if (heifResult.ok) {
+      return bestResult;
+    }
+  }
+
   ImageDecodeResult imageMagickResult =
       decodeWithImageMagick(data, sourceName, qtResult.message);
   if (imageMagickResult.ok && !compareContainerDecoders) {
@@ -215,23 +226,27 @@ ImageDecodeResult ImageDecoder::decodeToImage(const QByteArray& data,
   }
   keepLargerImage(&bestResult, imageMagickResult);
 
-  ImageDecodeResult ffmpegResult =
-      FfmpegImageDecoder::decodeToImage(data, sourceName, qtResult.message,
+  if (!compareContainerDecoders) {
+    heifResult =
+        HeifImageDecoder::decodeToImage(data, sourceName, qtResult.message,
                                         imageMagickResult.message);
-  keepLargerImage(&bestResult, ffmpegResult);
+    keepLargerImage(&bestResult, heifResult);
+  } else if (!imageMagickResult.ok && !heifResult.ok) {
+    heifResult.message += "。MagickWand 错误: " + imageMagickResult.message;
+  }
   if (bestResult.ok) {
     return bestResult;
   }
 
-  if (!ffmpegResult.ok) {
+  if (!heifResult.ok) {
     const QString diagnosticPath = writeDiagnosticCopy(data, sourceName);
-    ffmpegResult.message += "。文件识别: " +
-                            imageSignatureSummary(data, sourceName);
+    heifResult.message += "。文件识别: " +
+                          imageSignatureSummary(data, sourceName);
     if (!diagnosticPath.isEmpty()) {
-      ffmpegResult.message += "。已保存诊断副本: " + diagnosticPath;
+      heifResult.message += "。已保存诊断副本: " + diagnosticPath;
     }
   }
-  return ffmpegResult;
+  return heifResult;
 }
 
 QString ImageDecoder::supportedFormatsSummary() {

@@ -38,6 +38,7 @@ class PreviewCache {
   static QString cacheDirectoryPath();
   static PreviewCacheStats stats();
   static bool clear(QString* errorMessage = nullptr);
+  static QByteArray encodePreviewImage(const QImage& image);
 
  private:
   static QString cachePathForEntry(const RemoteEntry& entry,

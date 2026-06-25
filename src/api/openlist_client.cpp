@@ -164,7 +164,9 @@ void OpenListClient::getFileInfo(const QString& path, EntryCallback callback) {
            });
 }
 
-void OpenListClient::downloadUrl(const QUrl& url, DownloadCallback callback) {
+void OpenListClient::downloadUrl(const QUrl& url,
+                                 DownloadCallback callback,
+                                 DownloadProgressCallback progressCallback) {
   QNetworkRequest request(url);
   request.setHeader(QNetworkRequest::UserAgentHeader, "OpenListSorter/1.0");
   const QUrl apiBase(baseUrl_);
@@ -174,6 +176,13 @@ void OpenListClient::downloadUrl(const QUrl& url, DownloadCallback callback) {
   }
 
   QNetworkReply* reply = network_.get(request);
+  if (progressCallback) {
+    QObject::connect(reply, &QNetworkReply::downloadProgress, this,
+                     [progressCallback](qint64 bytesReceived,
+                                        qint64 bytesTotal) {
+                       progressCallback(bytesReceived, bytesTotal);
+                     });
+  }
   QObject::connect(reply, &QNetworkReply::finished, this,
                    [reply, callback]() {
                      const QByteArray payload = reply->readAll();
