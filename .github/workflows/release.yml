@@ -100,6 +100,35 @@ jobs:
       - name: Build
         run: cmake --build build-release --target openlist_sorter --parallel
 
+      - name: Validate Windows runtime
+        run: |
+          required_runtime_files=(
+            OpenListSorter.exe
+            Qt5Core.dll
+            Qt5Gui.dll
+            Qt5Widgets.dll
+            Qt5Network.dll
+            Qt5Multimedia.dll
+            Qt5MultimediaWidgets.dll
+            Qt5Svg.dll
+            Qt5Concurrent.dll
+            platforms/qwindows.dll
+            imageformats/qjpeg.dll
+            imageformats/qwebp.dll
+            iconengines/qsvgicon.dll
+            runtime/imagemagick/CORE_RL_MagickWand_.dll
+            runtime/imagemagick/CORE_RL_heif_.dll
+            runtime/imagemagick/modules/coders/IM_MOD_RL_heic_.dll
+            runtime/imagemagick/modules/coders/IM_MOD_RL_webp_.dll
+          )
+          for file in "${required_runtime_files[@]}"; do
+            if [ ! -f "build-release/dist/${file}" ]; then
+              echo "Missing Windows runtime file: ${file}"
+              find build-release/dist -maxdepth 2 -type f | sort
+              exit 1
+            fi
+          done
+
       - name: Package
         run: |
           package_name="OpenListSorter-windows-amd64"

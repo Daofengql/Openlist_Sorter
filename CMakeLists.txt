@@ -106,7 +106,7 @@ if(WIN32)
   set_target_properties(openlist_sorter PROPERTIES WIN32_EXECUTABLE TRUE)
 
   find_program(OPENLIST_SORTER_WINDEPLOYQT_EXECUTABLE
-    NAMES windeployqt
+    NAMES windeployqt windeployqt-qt5
     HINTS "${OPENLIST_SORTER_QT_ROOT}/bin"
     DOC "Qt runtime deployment tool"
   )
@@ -114,7 +114,6 @@ if(WIN32)
   if(OPENLIST_SORTER_WINDEPLOYQT_EXECUTABLE)
     add_custom_command(TARGET openlist_sorter POST_BUILD
       COMMAND "${OPENLIST_SORTER_WINDEPLOYQT_EXECUTABLE}"
-              --release
               --no-translations
               --no-angle
               --no-opengl-sw
