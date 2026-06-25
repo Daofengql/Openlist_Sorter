@@ -105,72 +105,51 @@ jobs:
         run: |
           set -euo pipefail
           dist="build-release/dist"
-          search_dirs=(/mingw64/bin)
 
-          declare -A source_dlls=()
-          declare -A existing_dlls=()
-          while IFS= read -r source_dll; do
-            source_dlls["$(basename "$source_dll" | tr '[:upper:]' '[:lower:]')"]="$source_dll"
-          done < <(find "${search_dirs[@]}" -maxdepth 1 -type f -iname '*.dll')
-
-          refresh_existing_dlls() {
-            existing_dlls=()
-            while IFS= read -r existing_dll; do
-              existing_dlls["$(basename "$existing_dll" | tr '[:upper:]' '[:lower:]')"]=1
-            done < <(find "$dist" -type f -iname '*.dll')
-          }
-
-          list_scanned_binaries() {
+          list_dependency_roots() {
             find "$dist" \
               -path "$dist/runtime/imagemagick" -prune -o \
               -iname 'libicudt*.dll' -prune -o \
               -type f \( -iname '*.exe' -o -iname '*.dll' \) -print
           }
 
-          is_known_system_dll() {
-            case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
-              api-ms-win-*|ext-ms-win-*|advapi32.dll|authz.dll|avrt.dll|bcrypt.dll|cfgmgr32.dll|combase.dll|comctl32.dll|comdlg32.dll|crypt32.dll|cryptui.dll|d3d9.dll|d3d11.dll|dbghelp.dll|dhcpcsvc.dll|dnsapi.dll|dwmapi.dll|dwrite.dll|dxgi.dll|dxva2.dll|evr.dll|gdi32.dll|gdi32full.dll|glu32.dll|hid.dll|imagehlp.dll|imm32.dll|iphlpapi.dll|kernel32.dll|ksuser.dll|mf.dll|mfplat.dll|mfreadwrite.dll|mfuuid.dll|mpr.dll|msdmo.dll|msimg32.dll|msvcrt.dll|netapi32.dll|normaliz.dll|ntdll.dll|ole32.dll|oleacc.dll|oleaut32.dll|olepro32.dll|opengl32.dll|powrprof.dll|propsys.dll|psapi.dll|rpcrt4.dll|secur32.dll|setupapi.dll|shell32.dll|shlwapi.dll|strmiids.dll|user32.dll|userenv.dll|uxtheme.dll|version.dll|winhttp.dll|wininet.dll|winmm.dll|winspool.drv|wlanapi.dll|wmcodecdspuuid.dll|wmvcore.dll|ws2_32.dll|wtsapi32.dll)
+          copy_dependency() {
+            local dep="$1"
+            case "$dep" in
+              /mingw64/bin/*.dll|/ucrt64/bin/*.dll)
+                ;;
+              *)
                 return 0
                 ;;
             esac
-            return 1
+
+            local target="$dist/$(basename "$dep")"
+            if [ ! -f "$target" ]; then
+              echo "Deploying Windows dependency $(basename "$dep")"
+              cp -f "$dep" "$target"
+              return 1
+            fi
+            return 0
           }
 
-          for pass in $(seq 1 6); do
-            refresh_existing_dlls
+          for pass in $(seq 1 8); do
             added=0
             while IFS= read -r binary; do
-              while IFS= read -r dll; do
-                [ -n "$dll" ] || continue
-                dll_key="$(echo "$dll" | tr '[:upper:]' '[:lower:]')"
-                if [ -n "${existing_dlls[$dll_key]:-}" ]; then
-                  continue
-                fi
-                if is_known_system_dll "$dll"; then
-                  continue
-                fi
-                if [ -n "${source_dlls[$dll_key]:-}" ]; then
-                  echo "Deploying Windows dependency $dll"
-                  cp -f "${source_dlls[$dll_key]}" "$dist/"
+              while IFS= read -r dep; do
+                if ! copy_dependency "$dep"; then
                   added=1
                 fi
-              done < <(objdump -p "$binary" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
-            done < <(list_scanned_binaries)
+              done < <(ldd "$binary" 2>/dev/null | awk '/=> \// { print $3 } /^\// { print $1 }')
+            done < <(list_dependency_roots)
             [ "$added" -eq 0 ] && break
           done
 
-          refresh_existing_dlls
           unresolved=()
           while IFS= read -r binary; do
-            while IFS= read -r dll; do
-              [ -n "$dll" ] || continue
-              dll_key="$(echo "$dll" | tr '[:upper:]' '[:lower:]')"
-              if [ -n "${existing_dlls[$dll_key]:-}" ] || is_known_system_dll "$dll"; then
-                continue
-              fi
-              unresolved+=("$binary -> $dll")
-            done < <(objdump -p "$binary" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
-          done < <(list_scanned_binaries)
+            while IFS= read -r missing; do
+              [ -n "$missing" ] && unresolved+=("$binary -> $missing")
+            done < <(ldd "$binary" 2>/dev/null | awk '/not found/ { print $1 }')
+          done < <(list_dependency_roots)
 
           if [ "${#unresolved[@]}" -gt 0 ]; then
             printf 'Unresolved Windows runtime dependencies:\n'
