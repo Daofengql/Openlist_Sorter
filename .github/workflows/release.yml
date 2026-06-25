@@ -101,10 +101,99 @@ jobs:
       - name: Build
         run: cmake --build build-release --target openlist_sorter --parallel
 
+      - name: Deploy Windows MinGW runtime dependencies
+        run: |
+          set -euo pipefail
+          dist="build-release/dist"
+          search_dirs=(/mingw64/bin)
+
+          is_known_system_dll() {
+            case "$(echo "$1" | tr '[:upper:]' '[:lower:]')" in
+              api-ms-win-*|ext-ms-win-*|advapi32.dll|authz.dll|avrt.dll|bcrypt.dll|cfgmgr32.dll|combase.dll|comctl32.dll|comdlg32.dll|crypt32.dll|cryptui.dll|d3d9.dll|d3d11.dll|dbghelp.dll|dhcpcsvc.dll|dnsapi.dll|dwmapi.dll|dwrite.dll|dxgi.dll|dxva2.dll|evr.dll|gdi32.dll|gdi32full.dll|glu32.dll|hid.dll|imagehlp.dll|imm32.dll|iphlpapi.dll|kernel32.dll|ksuser.dll|mf.dll|mfplat.dll|mfreadwrite.dll|mfuuid.dll|mpr.dll|msdmo.dll|msimg32.dll|msvcrt.dll|netapi32.dll|normaliz.dll|ntdll.dll|ole32.dll|oleacc.dll|oleaut32.dll|olepro32.dll|opengl32.dll|powrprof.dll|propsys.dll|psapi.dll|rpcrt4.dll|secur32.dll|setupapi.dll|shell32.dll|shlwapi.dll|strmiids.dll|user32.dll|userenv.dll|uxtheme.dll|version.dll|winhttp.dll|wininet.dll|winmm.dll|winspool.drv|wlanapi.dll|wmcodecdspuuid.dll|wmvcore.dll|ws2_32.dll|wtsapi32.dll)
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          find_existing_dependency() {
+            local binary_dir="$1"
+            local dll="$2"
+            for dir in "$binary_dir" "$dist" "$dist/runtime/imagemagick"; do
+              if [ -f "$dir/$dll" ]; then
+                return 0
+              fi
+              if find "$dir" -maxdepth 1 -iname "$dll" -type f -print -quit 2>/dev/null | grep -q .; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          find_source_dependency() {
+            local dll="$1"
+            for dir in "${search_dirs[@]}"; do
+              if [ -f "$dir/$dll" ]; then
+                printf '%s\n' "$dir/$dll"
+                return 0
+              fi
+              local match
+              match="$(find "$dir" -maxdepth 1 -iname "$dll" -type f -print -quit 2>/dev/null || true)"
+              if [ -n "$match" ]; then
+                printf '%s\n' "$match"
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          for pass in $(seq 1 20); do
+            added=0
+            while IFS= read -r binary; do
+              binary_dir="$(dirname "$binary")"
+              while IFS= read -r dll; do
+                [ -n "$dll" ] || continue
+                if find_existing_dependency "$binary_dir" "$dll"; then
+                  continue
+                fi
+                if is_known_system_dll "$dll"; then
+                  continue
+                fi
+                src="$(find_source_dependency "$dll" || true)"
+                if [ -n "$src" ]; then
+                  echo "Deploying Windows dependency $dll"
+                  cp -f "$src" "$dist/"
+                  added=1
+                fi
+              done < <(objdump -p "$binary" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
+            done < <(find "$dist" -type f \( -iname '*.exe' -o -iname '*.dll' \))
+            [ "$added" -eq 0 ] && break
+          done
+
+          unresolved=()
+          while IFS= read -r binary; do
+            binary_dir="$(dirname "$binary")"
+            while IFS= read -r dll; do
+              [ -n "$dll" ] || continue
+              if find_existing_dependency "$binary_dir" "$dll" || is_known_system_dll "$dll"; then
+                continue
+              fi
+              unresolved+=("$binary -> $dll")
+            done < <(objdump -p "$binary" 2>/dev/null | sed -n 's/^[[:space:]]*DLL Name: //p')
+          done < <(find "$dist" -type f \( -iname '*.exe' -o -iname '*.dll' \))
+
+          if [ "${#unresolved[@]}" -gt 0 ]; then
+            printf 'Unresolved Windows runtime dependencies:\n'
+            printf '  %s\n' "${unresolved[@]}"
+            exit 1
+          fi
+
       - name: Validate Windows runtime
         run: |
           required_runtime_files=(
             OpenListSorter.exe
+            libdouble-conversion.dll
+            libpcre2-16-0.dll
             Qt5Core.dll
             Qt5Gui.dll
             Qt5Widgets.dll
@@ -189,23 +278,6 @@ jobs:
           package_dir="artifacts/${package_name}"
           mkdir -p "$package_dir"
           cp -a build-release/dist/. "$package_dir/"
-          cp -a "$QT_ROOT/lib"/libQt5*.so* "$package_dir/"
-          for plugin_dir in platforms imageformats iconengines mediaservice audio; do
-            if [ -d "$QT_ROOT/plugins/$plugin_dir" ]; then
-              cp -a "$QT_ROOT/plugins/$plugin_dir" "$package_dir/"
-            fi
-          done
-
-          im_runtime="$package_dir/runtime/imagemagick"
-          im_lib="$im_runtime/lib"
-          im_config="$im_runtime/config"
-          im_coders="$im_runtime/modules/coders"
-          im_filters="$im_runtime/modules/filters"
-          mkdir -p "$im_lib" "$im_config" "$im_coders" "$im_filters"
-
-          find_ldconfig_library() {
-            ldconfig -p | awk -v pattern="$1" '$1 ~ pattern { print $NF; exit }'
-          }
 
           skip_system_dependency() {
             case "$(basename "$1")" in
@@ -216,18 +288,22 @@ jobs:
             return 1
           }
 
-          copy_library_file() {
-            local src="$1"
+          copy_library_file_to() {
+            local dest_dir="$1"
+            local src="$2"
             [ -e "$src" ] || return 0
             local real
             real="$(readlink -f "$src")"
-            cp -L "$src" "$im_lib/$(basename "$src")"
+            mkdir -p "$dest_dir"
+            cp -L "$src" "$dest_dir/$(basename "$src")"
             if [ "$(basename "$real")" != "$(basename "$src")" ]; then
-              cp -L "$real" "$im_lib/$(basename "$real")"
+              cp -L "$real" "$dest_dir/$(basename "$real")"
             fi
           }
 
-          copy_library_tree() {
+          copy_library_tree_to() {
+            local dest_dir="$1"
+            shift
             local queue=("$@")
             local item real dep
             declare -A seen=()
@@ -241,24 +317,42 @@ jobs:
               if skip_system_dependency "$real"; then
                 continue
               fi
-              copy_library_file "$item"
+              copy_library_file_to "$dest_dir" "$item"
               while IFS= read -r dep; do
                 [ -n "$dep" ] && queue+=("$dep")
               done < <(ldd "$real" 2>/dev/null | awk '/=> \// { print $3 } /^\t\// { print $1 }')
             done
           }
 
+          for plugin_dir in platforms imageformats iconengines mediaservice audio playlistformats; do
+            if [ -d "$QT_ROOT/plugins/$plugin_dir" ]; then
+              cp -a "$QT_ROOT/plugins/$plugin_dir" "$package_dir/"
+            fi
+          done
+
+          mapfile -t qt_runtime_inputs < <(find "$package_dir" -type f \( -name 'OpenListSorter' -o -name '*.so' -o -name '*.so.*' \))
+          copy_library_tree_to "$package_dir" "${qt_runtime_inputs[@]}"
+
+          im_runtime="$package_dir/runtime/imagemagick"
+          im_lib="$im_runtime/lib"
+          im_config="$im_runtime/config"
+          im_coders="$im_runtime/modules/coders"
+          im_filters="$im_runtime/modules/filters"
+          mkdir -p "$im_lib" "$im_config" "$im_coders" "$im_filters"
+
+          find_ldconfig_library() {
+            ldconfig -p | awk -v pattern="$1" '$1 ~ pattern { print $NF; exit }'
+          }
+
           magick_wand_lib="$(find_ldconfig_library '^libMagickWand-.*\.so')"
           magick_core_lib="$(find_ldconfig_library '^libMagickCore-.*\.so')"
           heif_lib="$(find_ldconfig_library '^libheif\.so')"
-          pulse_lib="$(find_ldconfig_library '^libpulse\.so')"
-          pulse_glib_lib="$(find_ldconfig_library '^libpulse-mainloop-glib\.so')"
           if [ -z "$magick_wand_lib" ] || [ -z "$magick_core_lib" ] || [ -z "$heif_lib" ]; then
             echo "Missing Linux ImageMagick/libheif runtime libraries."
             ldconfig -p | grep -E 'Magick(Wand|Core)|libheif' || true
             exit 1
           fi
-          copy_library_tree "$magick_wand_lib" "$magick_core_lib" "$heif_lib" "$pulse_lib" "$pulse_glib_lib"
+          copy_library_tree_to "$im_lib" "$magick_wand_lib" "$magick_core_lib" "$heif_lib"
 
           for config_dir in /etc/ImageMagick-7 /etc/ImageMagick-6; do
             if [ -d "$config_dir" ]; then
@@ -271,14 +365,32 @@ jobs:
             echo "Missing ImageMagick coder module directory."
             exit 1
           fi
-          cp -a "$coder_dir"/*.so "$im_coders/"
+          selected_coders=(
+            bmp
+            gif
+            heic
+            icon
+            jpeg
+            magick
+            miff
+            png
+            pnm
+            tga
+            tiff
+            webp
+          )
+          for coder in "${selected_coders[@]}"; do
+            if [ -f "$coder_dir/${coder}.so" ]; then
+              cp -a "$coder_dir/${coder}.so" "$im_coders/"
+            fi
+          done
 
           filter_dir="$(find /usr/lib /lib -type d -path '*ImageMagick*modules*filters' -print -quit 2>/dev/null || true)"
           if [ -n "$filter_dir" ]; then
             cp -a "$filter_dir"/*.so "$im_filters/" 2>/dev/null || true
           fi
 
-          copy_library_tree "$im_coders"/*.so "$im_filters"/*.so
+          copy_library_tree_to "$im_lib" "$im_coders"/*.so "$im_filters"/*.so
           test -f "$im_coders/heic.so" || { echo "Missing ImageMagick heic coder module."; ls -la "$im_coders"; exit 1; }
           test -f "$im_coders/webp.so" || { echo "Missing ImageMagick webp coder module."; ls -la "$im_coders"; exit 1; }
           echo "Prepared Linux ImageMagick runtime: $(find "$im_lib" -maxdepth 1 -type f | wc -l) libraries, $(find "$im_coders" -maxdepth 1 -type f | wc -l) coder modules."
