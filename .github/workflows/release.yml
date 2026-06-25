@@ -284,12 +284,14 @@ jobs:
             real="$(readlink -f "$src")"
             mkdir -p "$dest_dir"
             local target="$dest_dir/$(basename "$src")"
-            if [ ! -e "$target" ] || [ "$(readlink -f "$target")" != "$real" ]; then
+            if [ "$(readlink -m "$src")" != "$(readlink -m "$target")" ]; then
+              rm -f "$target"
               cp -L "$src" "$target"
             fi
             if [ "$(basename "$real")" != "$(basename "$src")" ]; then
               local real_target="$dest_dir/$(basename "$real")"
-              if [ ! -e "$real_target" ] || [ "$(readlink -f "$real_target")" != "$real" ]; then
+              if [ "$(readlink -m "$real")" != "$(readlink -m "$real_target")" ]; then
+                rm -f "$real_target"
                 cp -L "$real" "$real_target"
               fi
             fi
