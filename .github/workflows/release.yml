@@ -123,6 +123,7 @@ jobs:
           list_scanned_binaries() {
             find "$dist" \
               -path "$dist/runtime/imagemagick" -prune -o \
+              -iname 'libicudt*.dll' -prune -o \
               -type f \( -iname '*.exe' -o -iname '*.dll' \) -print
           }
 
@@ -135,7 +136,7 @@ jobs:
             return 1
           }
 
-          for pass in $(seq 1 10); do
+          for pass in $(seq 1 6); do
             refresh_existing_dlls
             added=0
             while IFS= read -r binary; do
