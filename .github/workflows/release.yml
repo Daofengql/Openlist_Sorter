@@ -191,6 +191,11 @@ jobs:
       - name: Package
         run: |
           package_name="OpenListSorter-windows-amd64"
+          echo "Windows package size before strip:"
+          du -sh build-release/dist
+          find build-release/dist -type f \( -iname '*.exe' -o -iname '*.dll' \) -exec strip --strip-unneeded {} + 2>/dev/null || true
+          echo "Windows package size after strip:"
+          du -sh build-release/dist
           mkdir -p "artifacts/${package_name}"
           cp -a build-release/dist/. "artifacts/${package_name}/"
           (cd artifacts && cmake -E tar cfv "${package_name}.zip" --format=zip "${package_name}")
@@ -321,9 +326,9 @@ jobs:
             ldconfig -p | awk -v pattern="$1" '$1 ~ pattern { print $NF; exit }'
           }
 
-          magick_wand_lib="$(find_ldconfig_library '^libMagickWand-.*\.so')"
-          magick_core_lib="$(find_ldconfig_library '^libMagickCore-.*\.so')"
-          heif_lib="$(find_ldconfig_library '^libheif\.so')"
+          magick_wand_lib="$(find_ldconfig_library '^libMagickWand-.*[.]so')"
+          magick_core_lib="$(find_ldconfig_library '^libMagickCore-.*[.]so')"
+          heif_lib="$(find_ldconfig_library '^libheif[.]so')"
           if [ -z "$magick_wand_lib" ] || [ -z "$magick_core_lib" ] || [ -z "$heif_lib" ]; then
             echo "Missing Linux ImageMagick/libheif runtime libraries."
             ldconfig -p | grep -E 'Magick(Wand|Core)|libheif' || true
@@ -382,6 +387,11 @@ jobs:
           EOF
           sed -i 's/^          //' "$package_dir/OpenListSorter.sh"
           chmod +x "$package_dir/OpenListSorter.sh"
+          echo "Linux package size before strip:"
+          du -sh "$package_dir"
+          find "$package_dir" -type f \( -name 'OpenListSorter' -o -name '*.so' -o -name '*.so.*' \) -exec strip --strip-unneeded {} + 2>/dev/null || true
+          echo "Linux package size after strip:"
+          du -sh "$package_dir"
           (cd artifacts && tar -czf "${package_name}.tar.gz" "${package_name}")
 
       - name: Upload artifact
