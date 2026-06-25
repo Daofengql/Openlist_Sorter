@@ -53,7 +53,12 @@ class MainWindow : public QMainWindow {
 
   bool showConnectionDialog(bool initialLaunch = false);
   void showConnectionInfoDialog();
+  void showSettingsDialog();
   void showAboutDialog();
+  void openProjectHomepage();
+  void openAuthorBlog();
+  void logout();
+  void refreshConnectionDiagnostics();
   void clearPreviewCache();
   void clearPreviewCacheSilently(const QString& reason);
   void clearCurrentSelection();
@@ -64,6 +69,7 @@ class MainWindow : public QMainWindow {
   void chooseDownloadDirectory();
   void downloadCurrentFile();
   void downloadCurrentFileFromUrl(const FileItem& item, const QUrl& url);
+  void deleteCurrentFile();
   void fetchFileData(const FileItem& item,
                      OpenListClient::DownloadCallback callback,
                      const QString& progressLabel = QString());
@@ -94,6 +100,8 @@ class MainWindow : public QMainWindow {
   void refreshFilePageControls();
   void preloadCurrentPage();
   void preloadNextPageItem(int generation, int index);
+  void startPreloadWorkers(int generation);
+  void finishPreloadItem(int generation, const QString& message);
   void setProgressVisible(bool visible);
   void setProgressValue(qint64 bytesReceived,
                         qint64 bytesTotal,
@@ -141,6 +149,7 @@ class MainWindow : public QMainWindow {
   QPushButton* browseDownloadPathButton_{};
   QPushButton* downloadCurrentButton_{};
   QPushButton* convertCurrentButton_{};
+  QPushButton* deleteCurrentButton_{};
   QPushButton* enterModeButton_{};
   QPushButton* saveButton_{};
   QCheckBox* overwriteCheck_{};
@@ -176,6 +185,9 @@ class MainWindow : public QMainWindow {
   QLabel* endpointStatusLabel_{};
   QLabel* operationStatusLabel_{};
   QProgressBar* operationProgressBar_{};
+  QString connectionLatencyText_;
+  QString connectionIpText_;
+  QString connectionVersionText_;
 
   QTableWidget* tagTable_{};
   QPushButton* addTagButton_{};
@@ -193,13 +205,17 @@ class MainWindow : public QMainWindow {
   int currentIndex_{-1};
   int currentPage_{};
   int pageSize_{20};
+  int preloadConcurrency_{2};
   int preloadGeneration_{};
   bool preloadInProgress_{};
   QVector<int> preloadQueue_;
   int preloadQueuePosition_{};
+  int preloadActiveCount_{};
+  int preloadCompletedCount_{};
   bool classificationMode_{};
   bool submitInProgress_{};
   bool downloadInProgress_{};
+  bool deleteInProgress_{};
   bool suppressTagChange_{};
   QPixmap currentPixmap_;
 };

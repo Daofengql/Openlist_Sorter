@@ -270,6 +270,11 @@ ImageDecodeResult ImageDecoder::decodeToImage(const QByteArray& data,
   return qtResult;
 }
 
+bool ImageDecoder::isHeifLikeData(const QByteArray& data,
+                                  const QString& sourceName) {
+  return shouldCompareContainerDecoders(data, sourceName);
+}
+
 QString ImageDecoder::supportedFormatsSummary() {
 #ifdef Q_OS_WIN
   return "WIC: bmp, gif, ico, jpeg, jpg, png, tif, tiff; libwebp: webp; "

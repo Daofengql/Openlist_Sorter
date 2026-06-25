@@ -7,6 +7,7 @@
 #include <QAction>
 #include <QApplication>
 #include <QBuffer>
+#include <QDesktopServices>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
@@ -26,11 +27,13 @@
 #include <QMediaContent>
 #include <QMenuBar>
 #include <QMessageBox>
+#include <QPointer>
 #include <QResizeEvent>
 #include <QSaveFile>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSplitter>
+#include <QSpinBox>
 #include <QStatusBar>
 #include <QStandardPaths>
 #include <QStyle>
@@ -39,6 +42,7 @@
 #include <QVBoxLayout>
 #include <QtConcurrent/QtConcurrent>
 
+#include "core/connection_profile.h"
 #include "preview/image_converter.h"
 #include "preview/image_decoder.h"
 #include "preview/preview_cache.h"
@@ -111,7 +115,7 @@ ImageDecodeResult decodeImageTask(const QByteArray& data,
                                   const QString& fileName,
                                   const RemoteEntry& cacheEntry) {
   ImageDecodeResult result = ImageDecoder::decodeToImage(data, fileName);
-  if (result.ok) {
+  if (result.ok && ImageDecoder::isHeifLikeData(data, fileName)) {
     PreviewCache::storeImage(cacheEntry, result.image);
   }
   return result;
@@ -136,35 +140,33 @@ ThumbnailLoadResult decodeThumbnailTask(const QByteArray& data,
 ImageConversionResult convertImageToWebpTask(const QByteArray& data,
                                              const QString& fileName,
                                              const RemoteEntry& cacheEntry) {
+  if (ImageDecoder::isHeifLikeData(data, fileName)) {
+    QByteArray decodedCacheData;
+    if (!PreviewCache::loadImageData(cacheEntry, &decodedCacheData)) {
+      ImageDecodeResult decoded = ImageDecoder::decodeToImage(data, fileName);
+      if (!decoded.ok) {
+        ImageConversionResult result;
+        result.hashSource = "HEIF 解码 JPG 缓存";
+        result.message = "HEIF/AVIF 解码缓存生成失败: " + decoded.message;
+        return result;
+      }
+      if (!PreviewCache::storeImage(cacheEntry, decoded.image) ||
+          !PreviewCache::loadImageData(cacheEntry, &decodedCacheData)) {
+        ImageConversionResult result;
+        result.hashSource = "HEIF 解码 JPG 缓存";
+        result.message = "HEIF/AVIF 解码缓存生成失败: 无法写入满质量 JPG 缓存";
+        return result;
+      }
+    }
+
+    return ImageConverter::convertToWebp(
+        decodedCacheData, QFileInfo(fileName).completeBaseName() + ".jpg",
+        "HEIF 解码 JPG 缓存");
+  }
+
   ImageConversionResult rawResult =
       ImageConverter::convertToWebp(data, fileName, "原始文件");
-  if (rawResult.ok) {
-    return rawResult;
-  }
-
-  QByteArray previewData;
-  if (!PreviewCache::loadImageData(cacheEntry, &previewData)) {
-    ImageDecodeResult decoded = ImageDecoder::decodeToImage(data, fileName);
-    if (!decoded.ok) {
-      rawResult.message += "；解码缓存生成失败: " + decoded.message;
-      return rawResult;
-    }
-    PreviewCache::storeImage(cacheEntry, decoded.image);
-    previewData = PreviewCache::encodePreviewImage(decoded.image);
-    if (previewData.isEmpty()) {
-      rawResult.message += "；解码缓存生成失败: 无法编码 JPG 缓存";
-      return rawResult;
-    }
-  }
-
-  ImageConversionResult cachedResult = ImageConverter::convertToWebp(
-      previewData, QFileInfo(fileName).completeBaseName() + ".webp", "解码缓存");
-  if (!cachedResult.ok) {
-    cachedResult.message =
-        "原始文件转 WebP 失败: " + rawResult.message +
-        "；解码缓存转 WebP 失败: " + cachedResult.message;
-  }
-  return cachedResult;
+  return rawResult;
 }
 
 QUrl resolvedOpenListUrl(const QString& baseUrl, const QString& urlText) {
@@ -213,7 +215,7 @@ void MainWindow::resizeEvent(QResizeEvent* event) {
 
 void MainWindow::buildUi() {
   setWindowTitle("OpenList Sorter");
-  resize(1360, 820);
+  resize(1440, 860);
 
   auto* central = new QWidget();
   auto* rootLayout = new QVBoxLayout(central);
@@ -255,7 +257,10 @@ void MainWindow::buildUi() {
 
 void MainWindow::buildMenuBar() {
   QMenu* fileMenu = menuBar()->addMenu("文件(&F)");
+  QAction* settingsAction = fileMenu->addAction("设置...");
   QAction* connectionInfoAction = fileMenu->addAction("连接信息...");
+  fileMenu->addSeparator();
+  QAction* logoutAction = fileMenu->addAction("注销");
   fileMenu->addSeparator();
   QAction* exitAction = fileMenu->addAction("退出");
 
@@ -266,10 +271,16 @@ void MainWindow::buildMenuBar() {
   QAction* clearPreviewCacheAction = editMenu->addAction("清理预览缓存...");
 
   QMenu* helpMenu = menuBar()->addMenu("帮助(&H)");
+  QAction* githubAction = helpMenu->addAction("GitHub 仓库");
+  QAction* blogAction = helpMenu->addAction("作者博客");
+  helpMenu->addSeparator();
   QAction* aboutAction = helpMenu->addAction("关于 OpenList Sorter");
 
+  QObject::connect(settingsAction, &QAction::triggered, this,
+                   &MainWindow::showSettingsDialog);
   QObject::connect(connectionInfoAction, &QAction::triggered, this,
                    &MainWindow::showConnectionInfoDialog);
+  QObject::connect(logoutAction, &QAction::triggered, this, &MainWindow::logout);
   QObject::connect(exitAction, &QAction::triggered, this, &QWidget::close);
   QObject::connect(clearCurrentAction, &QAction::triggered, this,
                    &MainWindow::clearCurrentSelection);
@@ -277,6 +288,10 @@ void MainWindow::buildMenuBar() {
                    &MainWindow::clearAllPendingSelections);
   QObject::connect(clearPreviewCacheAction, &QAction::triggered, this,
                    &MainWindow::clearPreviewCache);
+  QObject::connect(githubAction, &QAction::triggered, this,
+                   &MainWindow::openProjectHomepage);
+  QObject::connect(blogAction, &QAction::triggered, this,
+                   &MainWindow::openAuthorBlog);
   QObject::connect(aboutAction, &QAction::triggered, this,
                    &MainWindow::showAboutDialog);
 }
@@ -292,17 +307,20 @@ void MainWindow::buildTaskPanel(QVBoxLayout* rootLayout) {
   sourcePathEdit_ = new QLineEdit("/");
   sourcePathEdit_->setReadOnly(true);
   browseSourceButton_ = new QPushButton("选择源目录");
-  downloadPathEdit_ = new QLineEdit();
+  downloadPathEdit_ = new QLineEdit(panel);
   downloadPathEdit_->setReadOnly(true);
   downloadPathEdit_->setPlaceholderText("默认下载目录");
-  browseDownloadPathButton_ = new QPushButton("下载目录");
+  downloadPathEdit_->hide();
+  browseDownloadPathButton_ = new QPushButton("下载目录", panel);
+  browseDownloadPathButton_->hide();
   downloadCurrentButton_ = new QPushButton("下载当前");
   convertCurrentButton_ = new QPushButton("仅转换当前");
+  deleteCurrentButton_ = new QPushButton("删除当前");
   enterModeButton_ = new QPushButton("进入分类模式");
-  saveButton_ = new QPushButton("保存待提交");
-  saveButton_->setObjectName("primaryButton");
-  overwriteCheck_ = new QCheckBox("覆盖同名文件");
-  convertImageMoveCheck_ = new QCheckBox("保存时转 WebP");
+  overwriteCheck_ = new QCheckBox("覆盖同名文件", panel);
+  overwriteCheck_->hide();
+  convertImageMoveCheck_ = new QCheckBox("保存时转 WebP", panel);
+  convertImageMoveCheck_->hide();
   convertImageMoveCheck_->setToolTip(
       "图片保存时先转成 WebP 上传到目标目录，成功后删除 OpenList 源文件。");
 
@@ -312,14 +330,7 @@ void MainWindow::buildTaskPanel(QVBoxLayout* rootLayout) {
   layout->addWidget(browseSourceButton_, 0, 1);
   layout->addWidget(sourcePathEdit_, 0, 2, 1, 4);
   layout->addWidget(enterModeButton_, 0, 6);
-  layout->addWidget(saveButton_, 0, 7);
-  layout->addWidget(overwriteCheck_, 0, 8);
-  layout->addWidget(new QLabel("下载到"), 1, 0);
-  layout->addWidget(browseDownloadPathButton_, 1, 1);
-  layout->addWidget(downloadPathEdit_, 1, 2, 1, 3);
-  layout->addWidget(downloadCurrentButton_, 1, 6);
-  layout->addWidget(convertCurrentButton_, 1, 7);
-  layout->addWidget(convertImageMoveCheck_, 1, 8);
+  layout->addWidget(convertCurrentButton_, 0, 7);
   layout->setColumnStretch(2, 1);
   layout->setColumnStretch(3, 1);
   layout->setColumnStretch(4, 1);
@@ -460,8 +471,22 @@ QWidget* MainWindow::buildPreviewPanel() {
   auto* navRow = new QHBoxLayout();
   prevButton_ = new QPushButton("上一个");
   nextButton_ = new QPushButton("下一个");
+  downloadCurrentButton_->setText("");
+  downloadCurrentButton_->setIcon(style()->standardIcon(QStyle::SP_DialogSaveButton));
+  downloadCurrentButton_->setToolTip("下载当前文件");
+  downloadCurrentButton_->setFixedSize(38, 34);
+  downloadCurrentButton_->setIconSize(QSize(18, 18));
+  deleteCurrentButton_->setText("");
+  deleteCurrentButton_->setIcon(style()->standardIcon(QStyle::SP_TrashIcon));
+  deleteCurrentButton_->setToolTip("删除当前远程文件");
+  deleteCurrentButton_->setObjectName("destructiveButton");
+  deleteCurrentButton_->setFixedSize(38, 34);
+  deleteCurrentButton_->setIconSize(QSize(18, 18));
   navRow->addWidget(prevButton_);
   navRow->addStretch(1);
+  navRow->addWidget(downloadCurrentButton_);
+  navRow->addWidget(deleteCurrentButton_);
+  navRow->addSpacing(10);
   navRow->addWidget(nextButton_);
 
   layout->addWidget(previewTitleLabel_);
@@ -520,6 +545,9 @@ QWidget* MainWindow::buildTagPanel() {
   multiTagNotice_->setObjectName("warningLabel");
   multiTagNotice_->setWordWrap(true);
   multiTagNotice_->hide();
+  saveButton_ = new QPushButton("保存待提交");
+  saveButton_->setObjectName("primaryButton");
+  saveButton_->setMinimumHeight(36);
 
   layout->addWidget(title);
   layout->addWidget(tagTable_);
@@ -528,6 +556,7 @@ QWidget* MainWindow::buildTagPanel() {
   layout->addWidget(currentTitle);
   layout->addWidget(tagScrollArea_, 1);
   layout->addWidget(multiTagNotice_);
+  layout->addWidget(saveButton_);
   return panel;
 }
 
@@ -540,6 +569,8 @@ void MainWindow::connectSignals() {
                    &MainWindow::downloadCurrentFile);
   QObject::connect(convertCurrentButton_, &QPushButton::clicked, this,
                    &MainWindow::convertCurrentFileOnly);
+  QObject::connect(deleteCurrentButton_, &QPushButton::clicked, this,
+                   &MainWindow::deleteCurrentFile);
   QObject::connect(enterModeButton_, &QPushButton::clicked, this, [this]() {
     if (classificationMode_) {
       exitClassificationMode();
@@ -600,6 +631,9 @@ void MainWindow::applyModernStyle() {
       color: #172033;
       font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
       font-size: 14px;
+    }
+    QLabel {
+      background: transparent;
     }
     QWidget#surface {
       background: #ffffff;
@@ -685,7 +719,7 @@ void MainWindow::applyModernStyle() {
     }
     QPushButton:disabled {
       color: #98a2b3;
-      background: #f2f4f7;
+      background: #f8fafc;
       border-color: #e4e7ec;
     }
     QPushButton#primaryButton {
@@ -697,6 +731,21 @@ void MainWindow::applyModernStyle() {
     QPushButton#primaryButton:hover {
       background: #2447d8;
       border-color: #2447d8;
+    }
+    QPushButton#destructiveButton {
+      color: #ffffff;
+      background: #dc2626;
+      border-color: #dc2626;
+      font-weight: 700;
+    }
+    QPushButton#destructiveButton:hover {
+      background: #b91c1c;
+      border-color: #b91c1c;
+    }
+    QPushButton#destructiveButton:disabled {
+      color: #fee2e2;
+      background: #fecaca;
+      border-color: #fecaca;
     }
     QMenuBar {
       background: #ffffff;
@@ -808,8 +857,11 @@ void MainWindow::loadSettings() {
       QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
   downloadPathEdit_->setText(
       settings.value("task/downloadPath", defaultDownloadPath).toString());
+  overwriteCheck_->setChecked(settings.value("task/overwrite", false).toBool());
   convertImageMoveCheck_->setChecked(
       settings.value("task/convertImageMove", false).toBool());
+  preloadConcurrency_ =
+      qBound(1, settings.value("task/preloadConcurrency", 2).toInt(), 10);
 
   const int tagCount = settings.beginReadArray("tags");
   tags_.clear();
@@ -831,8 +883,10 @@ void MainWindow::saveSettings() const {
   QSettings settings;
   settings.setValue("task/sourcePath", sourcePath_);
   settings.setValue("task/downloadPath", downloadPathEdit_->text());
+  settings.setValue("task/overwrite", overwriteCheck_->isChecked());
   settings.setValue("task/convertImageMove",
                     convertImageMoveCheck_->isChecked());
+  settings.setValue("task/preloadConcurrency", preloadConcurrency_);
 
   settings.beginWriteArray("tags");
   for (int i = 0; i < tags_.size(); ++i) {
@@ -861,6 +915,7 @@ bool MainWindow::showConnectionDialog(bool initialLaunch) {
   showInfoPage("等待开始", "请选择源目录并进入分类模式。");
   updateEndpointStatus();
   setOperationStatus("已连接: " + client_.baseUrl());
+  refreshConnectionDiagnostics();
   updateModeControls();
   saveSettings();
   return true;
@@ -868,8 +923,85 @@ bool MainWindow::showConnectionDialog(bool initialLaunch) {
 
 void MainWindow::showConnectionInfoDialog() {
   ConnectionInfoDialog dialog(client_.baseUrl(), client_.hasConnection(), this);
-  if (dialog.exec() == QDialog::Accepted && dialog.reconnectRequested()) {
-    showConnectionDialog();
+  if (client_.hasConnection()) {
+    QPointer<ConnectionInfoDialog> dialogPtr(&dialog);
+    client_.fetchConnectionDiagnostics(
+        [dialogPtr](const ConnectionDiagnostics& diagnostics) {
+          if (dialogPtr) {
+            dialogPtr->setDiagnostics(diagnostics);
+          }
+        });
+  }
+  dialog.exec();
+}
+
+void MainWindow::showSettingsDialog() {
+  QDialog dialog(this);
+  dialog.setWindowTitle("设置");
+  dialog.setMinimumWidth(560);
+
+  auto* root = new QVBoxLayout(&dialog);
+  auto* form = new QFormLayout();
+
+  auto* downloadEdit = new QLineEdit(downloadPathEdit_->text());
+  downloadEdit->setReadOnly(true);
+  auto* browseButton = new QPushButton("选择目录");
+  auto* downloadRow = new QHBoxLayout();
+  downloadRow->addWidget(downloadEdit, 1);
+  downloadRow->addWidget(browseButton);
+  form->addRow("默认下载目录", downloadRow);
+
+  auto* overwriteCheck = new QCheckBox("覆盖同名文件");
+  overwriteCheck->setChecked(overwriteCheck_->isChecked());
+  auto* convertCheck = new QCheckBox("保存时转 WebP");
+  convertCheck->setChecked(convertImageMoveCheck_->isChecked());
+  convertCheck->setToolTip(
+      "图片保存时先转成 WebP 上传到目标目录，成功后删除 OpenList 源文件。");
+  auto* preloadConcurrencySpin = new QSpinBox();
+  preloadConcurrencySpin->setRange(1, 10);
+  preloadConcurrencySpin->setValue(preloadConcurrency_);
+  preloadConcurrencySpin->setSuffix(" 个");
+  preloadConcurrencySpin->setToolTip(
+      "切换分页时，同时下载和处理当前页图片缓存的任务数量。");
+  form->addRow("保存行为", overwriteCheck);
+  form->addRow("图片处理", convertCheck);
+  form->addRow("分页预热并发", preloadConcurrencySpin);
+  root->addLayout(form);
+
+  auto* buttons =
+      new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+  root->addWidget(buttons);
+
+  QObject::connect(browseButton, &QPushButton::clicked, &dialog, [&]() {
+    const QString startPath = downloadEdit->text().isEmpty()
+                                  ? QStandardPaths::writableLocation(
+                                        QStandardPaths::DownloadLocation)
+                                  : downloadEdit->text();
+    const QString directory = QFileDialog::getExistingDirectory(
+        &dialog, "选择默认下载目录", startPath);
+    if (!directory.isEmpty()) {
+      downloadEdit->setText(QDir::toNativeSeparators(directory));
+    }
+  });
+  QObject::connect(buttons, &QDialogButtonBox::accepted, &dialog,
+                   &QDialog::accept);
+  QObject::connect(buttons, &QDialogButtonBox::rejected, &dialog,
+                   &QDialog::reject);
+
+  if (dialog.exec() != QDialog::Accepted) {
+    return;
+  }
+
+  downloadPathEdit_->setText(downloadEdit->text());
+  overwriteCheck_->setChecked(overwriteCheck->isChecked());
+  convertImageMoveCheck_->setChecked(convertCheck->isChecked());
+  const int oldPreloadConcurrency = preloadConcurrency_;
+  preloadConcurrency_ = preloadConcurrencySpin->value();
+  saveSettings();
+  updateModeControls();
+  if (classificationMode_ && oldPreloadConcurrency != preloadConcurrency_ &&
+      !submitInProgress_ && !downloadInProgress_ && !deleteInProgress_) {
+    preloadCurrentPage();
   }
 }
 
@@ -879,6 +1011,92 @@ void MainWindow::showAboutDialog() {
       "OpenList Sorter\n\n"
       "一个用于 OpenList/Alist 的远程文件打标归档工具。\n\n"
       "当前版本侧重连续预览、tag 暂存、批量移动和复制。");
+}
+
+void MainWindow::openProjectHomepage() {
+  QDesktopServices::openUrl(
+      QUrl("https://github.com/Daofengql/Openlist_Sorter"));
+}
+
+void MainWindow::openAuthorBlog() {
+  QDesktopServices::openUrl(QUrl("https://www.silverdragon.cn"));
+}
+
+void MainWindow::logout() {
+  if (submitInProgress_ || downloadInProgress_ || deleteInProgress_) {
+    QMessageBox::information(
+        this, "暂时无法注销",
+        "当前仍有提交、下载或删除任务正在进行。请等待任务完成后再注销。");
+    return;
+  }
+
+  int pending = 0;
+  for (const FileItem& file : files_) {
+    if (!file.submitted && !file.selectedTags.isEmpty()) {
+      ++pending;
+    }
+  }
+
+  QString detail =
+      "注销后将断开与 OpenList 的连接，关闭当前主窗口，并关闭下次启动时的自动登录。"
+      "\n\n已保存的连接地址和凭据会保留，之后可以手动重新连接。";
+  if (pending > 0) {
+    detail += QString("\n\n当前有 %1 个已选择但未保存的分类项，注销后这些本地选择不会保留。")
+                  .arg(pending);
+  }
+
+  QMessageBox confirm(this);
+  confirm.setIcon(QMessageBox::Question);
+  confirm.setWindowTitle("确认注销");
+  confirm.setText("确认注销当前会话？");
+  confirm.setInformativeText(detail);
+  confirm.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+  confirm.setDefaultButton(QMessageBox::No);
+  if (auto* yesButton = confirm.button(QMessageBox::Yes)) {
+    yesButton->setText("注销");
+  }
+  if (auto* noButton = confirm.button(QMessageBox::No)) {
+    noButton->setText("取消");
+  }
+
+  if (confirm.exec() != QMessageBox::Yes) {
+    return;
+  }
+
+  ConnectionSettingsStore::disableAutoLogin();
+  close();
+}
+
+void MainWindow::refreshConnectionDiagnostics() {
+  if (!client_.hasConnection()) {
+    connectionLatencyText_.clear();
+    connectionIpText_.clear();
+    connectionVersionText_.clear();
+    updateEndpointStatus();
+    return;
+  }
+
+  connectionLatencyText_ = "检测中";
+  connectionIpText_ = "检测中";
+  connectionVersionText_ = "检测中";
+  updateEndpointStatus();
+
+  QPointer<MainWindow> window(this);
+  client_.fetchConnectionDiagnostics(
+      [window](const ConnectionDiagnostics& diagnostics) {
+        if (!window) {
+          return;
+        }
+        window->connectionLatencyText_ =
+            diagnostics.latencyMs >= 0
+                ? QString::number(diagnostics.latencyMs) + " ms"
+                : "未知";
+        window->connectionIpText_ =
+            diagnostics.ipAddress.isEmpty() ? "未知" : diagnostics.ipAddress;
+        window->connectionVersionText_ =
+            diagnostics.version.isEmpty() ? "未知" : diagnostics.version;
+        window->updateEndpointStatus();
+      });
 }
 
 void MainWindow::clearPreviewCache() {
@@ -1019,9 +1237,20 @@ void MainWindow::updateEndpointStatus() {
   if (!endpointStatusLabel_) {
     return;
   }
-  endpointStatusLabel_->setText(client_.hasConnection()
-                                    ? "Endpoint: " + client_.baseUrl()
-                                    : "Endpoint: 未连接");
+  if (!client_.hasConnection()) {
+    endpointStatusLabel_->setText("Endpoint: 未连接");
+    return;
+  }
+
+  QStringList parts;
+  parts << "Endpoint: " + client_.baseUrl();
+  if (!connectionLatencyText_.isEmpty()) {
+    parts << "延迟: " + connectionLatencyText_;
+  }
+  if (!connectionVersionText_.isEmpty()) {
+    parts << "版本: " + connectionVersionText_;
+  }
+  endpointStatusLabel_->setText(parts.join("  |  "));
 }
 
 void MainWindow::chooseSourceDirectory() {
@@ -1125,6 +1354,134 @@ void MainWindow::downloadCurrentFileFromUrl(const FileItem& item,
   }, "正在下载 " + item.entry.name);
 }
 
+void MainWindow::deleteCurrentFile() {
+  const FileItem* item = currentFile();
+  if (!item) {
+    QMessageBox::information(this, "没有当前文件", "请先选择一个文件。");
+    return;
+  }
+  if (item->submitted) {
+    QMessageBox::information(
+        this, "文件已提交",
+        "当前文件已经提交过，源位置可能已经发生变化。请刷新目录后再删除。");
+    return;
+  }
+  if (submitInProgress_ || downloadInProgress_ || deleteInProgress_) {
+    return;
+  }
+
+  const int deleteIndex = currentIndex_;
+  const RemoteEntry entry = item->entry;
+  QMessageBox confirm(this);
+  confirm.setIcon(QMessageBox::Warning);
+  confirm.setWindowTitle("确认删除远程文件");
+  confirm.setText("确认从 OpenList 删除当前文件？");
+  confirm.setInformativeText(
+      "此操作会直接删除远程文件，无法通过本程序撤销。\n\n文件: " +
+      entry.name + "\n路径: " + entry.path);
+  confirm.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+  confirm.setDefaultButton(QMessageBox::No);
+  if (auto* yesButton = confirm.button(QMessageBox::Yes)) {
+    yesButton->setText("删除");
+  }
+  if (auto* noButton = confirm.button(QMessageBox::No)) {
+    noButton->setText("取消");
+  }
+  if (confirm.exec() != QMessageBox::Yes) {
+    return;
+  }
+
+  QMessageBox finalConfirm(this);
+  finalConfirm.setIcon(QMessageBox::Critical);
+  finalConfirm.setWindowTitle("最终确认删除");
+  finalConfirm.setText("请再次确认是否删除该远程文件。");
+  finalConfirm.setInformativeText(
+      "确认后将立即向 OpenList 提交删除请求。\n\n远程路径: " +
+      entry.path);
+  finalConfirm.setStandardButtons(QMessageBox::Yes | QMessageBox::No);
+  finalConfirm.setDefaultButton(QMessageBox::No);
+  if (auto* yesButton = finalConfirm.button(QMessageBox::Yes)) {
+    yesButton->setText("确认删除");
+  }
+  if (auto* noButton = finalConfirm.button(QMessageBox::No)) {
+    noButton->setText("取消");
+  }
+  if (finalConfirm.exec() != QMessageBox::Yes) {
+    return;
+  }
+
+  ++preloadGeneration_;
+  preloadInProgress_ = false;
+  preloadQueue_.clear();
+  preloadQueuePosition_ = 0;
+  preloadActiveCount_ = 0;
+  preloadCompletedCount_ = 0;
+  setProgressVisible(false);
+  mediaPlayer_->stop();
+  mediaPlayer_->setMedia(QMediaContent());
+  deleteInProgress_ = true;
+  setOperationStatus("正在删除远程文件: " + entry.name);
+  updateModeControls();
+
+  client_.removeFile(parentRemotePath(entry.path), entry.name,
+                     [this, deleteIndex, entry](bool ok,
+                                                const QString& message) {
+                       deleteInProgress_ = false;
+                       if (!ok) {
+                         setOperationStatus("删除失败: " + entry.name);
+                         if (deleteIndex >= 0 && deleteIndex < files_.size() &&
+                             files_[deleteIndex].entry.path == entry.path) {
+                           files_[deleteIndex].failed = true;
+                           files_[deleteIndex].lastError = message;
+                           updateFileListRow(deleteIndex);
+                         }
+                         updateModeControls();
+                         QMessageBox::warning(this, "删除失败", message);
+                         return;
+                       }
+
+                       int removedIndex = deleteIndex;
+                       if (removedIndex < 0 || removedIndex >= files_.size() ||
+                           files_[removedIndex].entry.path != entry.path) {
+                         removedIndex = -1;
+                         for (int i = 0; i < files_.size(); ++i) {
+                           if (files_[i].entry.path == entry.path) {
+                             removedIndex = i;
+                             break;
+                           }
+                         }
+                       }
+                       if (removedIndex >= 0 && removedIndex < files_.size()) {
+                         files_.remove(removedIndex);
+                       }
+
+                       currentPixmap_ = QPixmap();
+                       imageLabel_->clearImage();
+                       if (files_.isEmpty()) {
+                         currentIndex_ = -1;
+                         currentPage_ = 0;
+                         rebuildFileList();
+                         rebuildTagChecks();
+                         refreshStats();
+                         showInfoPage("已删除", "当前目录没有剩余可分类文件。");
+                       } else {
+                         const int nextIndex =
+                             qMin(removedIndex < 0 ? deleteIndex : removedIndex,
+                                  files_.size() - 1);
+                         currentIndex_ = -1;
+                         currentPage_ = qBound(0, nextIndex / pageSize_,
+                                               (files_.size() + pageSize_ - 1) /
+                                                       pageSize_ -
+                                                   1);
+                         rebuildFileList();
+                         setCurrentIndex(nextIndex);
+                       }
+
+                       setOperationStatus("已删除远程文件: " + entry.name);
+                       updateModeControls();
+                     });
+}
+
 void MainWindow::fetchFileData(const FileItem& item,
                                OpenListClient::DownloadCallback callback,
                                const QString& progressLabel) {
@@ -1201,7 +1558,7 @@ void MainWindow::convertCurrentFileOnly() {
     QMessageBox::information(this, "不是图片", "当前文件不是可转换的图片。");
     return;
   }
-  if (submitInProgress_ || downloadInProgress_) {
+  if (submitInProgress_ || downloadInProgress_ || deleteInProgress_) {
     return;
   }
 
@@ -1494,57 +1851,11 @@ void MainWindow::renderImage(const FileItem& item, const QString& rawUrl) {
 
   auto startThumbnail = [this, expectedPath, fileName, cacheEntry, thumbUrl,
                          startDownload]() {
-    if (thumbUrl.isEmpty()) {
-      startDownload();
-      return;
-    }
-
-    const QUrl url = resolvedOpenListUrl(client_.baseUrl(), thumbUrl);
-    if (!url.isValid()) {
-      startDownload();
-      return;
-    }
-
-    setOperationStatus("正在加载缩略图预览: " + fileName);
-    client_.downloadUrl(
-        url,
-        [this, expectedPath, fileName, cacheEntry, startDownload](
-            bool ok, const QString&, const QByteArray& data) {
-          setProgressVisible(false);
-          if (currentFilePath() != expectedPath) {
-            return;
-          }
-          if (!ok) {
-            startDownload();
-            return;
-          }
-
-          auto* watcher = new QFutureWatcher<ThumbnailLoadResult>(this);
-          QObject::connect(
-              watcher, &QFutureWatcher<ThumbnailLoadResult>::finished, this,
-              [this, watcher, expectedPath, fileName, startDownload]() {
-                const ThumbnailLoadResult thumb = watcher->result();
-                watcher->deleteLater();
-                if (currentFilePath() != expectedPath) {
-                  return;
-                }
-                if (thumb.ok && imageLargeEnoughForPreview(thumb.image)) {
-                  currentPixmap_ = QPixmap::fromImage(thumb.image);
-                  previewTitleLabel_->setText(fileName + " / 缩略图预览");
-                  previewStack_->setCurrentWidget(imagePage_);
-                  setOperationStatus("已从缩略图加载图片预览: " + fileName);
-                  updateImagePreviewScale();
-                  return;
-                }
-                startDownload();
-              });
-          watcher->setFuture(
-              QtConcurrent::run(decodeThumbnailTask, data, fileName, cacheEntry));
-        },
-        [this, fileName](qint64 bytesReceived, qint64 bytesTotal) {
-          setProgressValue(bytesReceived, bytesTotal,
-                           "正在读取缩略图 " + fileName);
-        });
+    Q_UNUSED(expectedPath);
+    Q_UNUSED(fileName);
+    Q_UNUSED(cacheEntry);
+    Q_UNUSED(thumbUrl);
+    startDownload();
   };
 
   auto* cacheWatcher = new QFutureWatcher<ImageCacheLoadResult>(this);
@@ -1564,28 +1875,8 @@ void MainWindow::renderImage(const FileItem& item, const QString& rawUrl) {
           updateImagePreviewScale();
           return;
         }
-        auto* thumbCacheWatcher = new QFutureWatcher<ThumbnailLoadResult>(this);
-        QObject::connect(
-            thumbCacheWatcher,
-            &QFutureWatcher<ThumbnailLoadResult>::finished, this,
-            [this, thumbCacheWatcher, expectedPath, fileName, startThumbnail]() {
-              const ThumbnailLoadResult thumb = thumbCacheWatcher->result();
-              thumbCacheWatcher->deleteLater();
-              if (currentFilePath() != expectedPath) {
-                return;
-              }
-              if (thumb.ok && imageLargeEnoughForPreview(thumb.image)) {
-                currentPixmap_ = QPixmap::fromImage(thumb.image);
-                previewTitleLabel_->setText(fileName + " / 缓存缩略图");
-                previewStack_->setCurrentWidget(imagePage_);
-                setOperationStatus("已从缓存缩略图加载图片预览: " + fileName);
-                updateImagePreviewScale();
-                return;
-              }
-              startThumbnail();
-            });
-        thumbCacheWatcher->setFuture(
-            QtConcurrent::run(loadCachedThumbnailTask, cacheEntry));
+        Q_UNUSED(cacheEntry);
+        startThumbnail();
       });
   cacheWatcher->setFuture(QtConcurrent::run(loadCachedImageTask, cacheEntry));
 }
@@ -1785,10 +2076,12 @@ void MainWindow::preloadCurrentPage() {
   ++preloadGeneration_;
   preloadQueue_.clear();
   preloadQueuePosition_ = 0;
+  preloadActiveCount_ = 0;
+  preloadCompletedCount_ = 0;
   preloadInProgress_ = false;
 
   if (!classificationMode_ || submitInProgress_ || downloadInProgress_ ||
-      files_.isEmpty()) {
+      deleteInProgress_ || files_.isEmpty()) {
     setProgressVisible(false);
     return;
   }
@@ -1812,20 +2105,20 @@ void MainWindow::preloadCurrentPage() {
 
   const int generation = preloadGeneration_;
   QTimer::singleShot(0, this, [this, generation]() {
-    preloadNextPageItem(generation, 0);
+    startPreloadWorkers(generation);
   });
 }
 
-void MainWindow::preloadNextPageItem(int generation, int position) {
+void MainWindow::startPreloadWorkers(int generation) {
   if (generation != preloadGeneration_ || !classificationMode_ ||
-      submitInProgress_ || downloadInProgress_) {
+      submitInProgress_ || downloadInProgress_ || deleteInProgress_) {
     preloadInProgress_ = false;
     setProgressVisible(false);
     return;
   }
 
-  preloadQueuePosition_ = position;
-  if (position >= preloadQueue_.size()) {
+  if (preloadCompletedCount_ >= preloadQueue_.size() &&
+      preloadActiveCount_ == 0) {
     preloadInProgress_ = false;
     setProgressVisible(false);
     setOperationStatus(QString("当前页缓存已准备: %1-%2 / %3")
@@ -1835,34 +2128,101 @@ void MainWindow::preloadNextPageItem(int generation, int position) {
     return;
   }
 
+  const int concurrency = qBound(1, preloadConcurrency_, 10);
+  while (preloadActiveCount_ < concurrency &&
+         preloadQueuePosition_ < preloadQueue_.size()) {
+    const int position = preloadQueuePosition_;
+    ++preloadQueuePosition_;
+    ++preloadActiveCount_;
+    preloadNextPageItem(generation, position);
+  }
+}
+
+void MainWindow::finishPreloadItem(int generation, const QString& message) {
+  if (generation != preloadGeneration_) {
+    return;
+  }
+  if (preloadActiveCount_ > 0) {
+    --preloadActiveCount_;
+  }
+  ++preloadCompletedCount_;
+  if (operationProgressBar_) {
+    operationProgressBar_->setRange(0, preloadQueue_.size());
+    operationProgressBar_->setValue(preloadCompletedCount_);
+    operationProgressBar_->show();
+  }
+  if (!message.isEmpty()) {
+    setOperationStatus(QString("预热当前页缓存: %1 / %2（%3）")
+                           .arg(preloadCompletedCount_)
+                           .arg(preloadQueue_.size())
+                           .arg(message));
+  }
+  startPreloadWorkers(generation);
+}
+
+void MainWindow::preloadNextPageItem(int generation, int position) {
+  if (generation != preloadGeneration_ || !classificationMode_ ||
+      submitInProgress_ || downloadInProgress_ || deleteInProgress_) {
+    return;
+  }
+
+  auto complete = [this, generation](const QString& message) {
+    QTimer::singleShot(0, this, [this, generation, message]() {
+      finishPreloadItem(generation, message);
+    });
+  };
+
   const int index = preloadQueue_[position];
   if (index < 0 || index >= files_.size()) {
-    preloadNextPageItem(generation, position + 1);
+    complete("跳过无效项");
     return;
   }
 
   FileItem item = files_[index];
   const int humanPosition = position + 1;
   if (!isImageFileName(item.entry.name)) {
-    if (operationProgressBar_) {
-      operationProgressBar_->setRange(0, preloadQueue_.size());
-      operationProgressBar_->setValue(humanPosition);
-    }
-    preloadNextPageItem(generation, position + 1);
+    complete("非图片");
     return;
   }
 
+  auto decodeHeifCache = [this, generation, item, humanPosition, complete](
+                             const QByteArray& data) {
+    setOperationStatus(QString("正在生成 HEIF JPG 缓存 %1 / %2: %3")
+                           .arg(humanPosition)
+                           .arg(preloadQueue_.size())
+                           .arg(item.entry.name));
+    auto* watcher = new QFutureWatcher<ImageDecodeResult>(this);
+    QObject::connect(
+        watcher, &QFutureWatcher<ImageDecodeResult>::finished, this,
+        [this, watcher, generation, item, complete]() {
+          const ImageDecodeResult decoded = watcher->result();
+          watcher->deleteLater();
+          if (generation != preloadGeneration_) {
+            return;
+          }
+          if (decoded.ok) {
+            complete("HEIF JPG 缓存");
+          } else {
+            complete("HEIF JPG 缓存失败: " + decoded.message);
+          }
+        });
+    watcher->setFuture(
+        QtConcurrent::run(decodeImageTask, data, item.entry.name, item.entry));
+  };
+
   QImage cachedImage;
   if (PreviewCache::loadImage(item.entry, &cachedImage)) {
-    if (operationProgressBar_) {
-      operationProgressBar_->setRange(0, preloadQueue_.size());
-      operationProgressBar_->setValue(humanPosition);
-      operationProgressBar_->show();
+    complete("JPG 解码缓存");
+    return;
+  }
+
+  QByteArray cachedRawData;
+  if (PreviewCache::loadRawData(item.entry, &cachedRawData)) {
+    if (ImageDecoder::isHeifLikeData(cachedRawData, item.entry.name)) {
+      decodeHeifCache(cachedRawData);
+      return;
     }
-    setOperationStatus(QString("预热当前页缓存: %1 / %2（已缓存）")
-                           .arg(humanPosition)
-                           .arg(preloadQueue_.size()));
-    preloadNextPageItem(generation, position + 1);
+    complete("原始数据缓存");
     return;
   }
 
@@ -1885,7 +2245,7 @@ void MainWindow::preloadNextPageItem(int generation, int position) {
             preloadNextPageItem(generation, position);
             return;
           }
-          preloadNextPageItem(generation, position + 1);
+          finishPreloadItem(generation, "下载地址获取失败");
         });
     return;
   }
@@ -1896,53 +2256,22 @@ void MainWindow::preloadNextPageItem(int generation, int position) {
                          .arg(item.entry.name));
   fetchFileData(
       item,
-      [this, generation, position, item, humanPosition](
+      [this, generation, item, decodeHeifCache, complete](
           bool ok, const QString& message, const QByteArray& data) {
         if (generation != preloadGeneration_) {
           return;
         }
         if (!ok) {
-          setOperationStatus(QString("预热失败 %1 / %2: %3")
-                                 .arg(humanPosition)
-                                 .arg(preloadQueue_.size())
-                                 .arg(message));
-          preloadNextPageItem(generation, position + 1);
+          complete("预热失败: " + message);
           return;
         }
 
-        setOperationStatus(QString("正在解码预热缓存 %1 / %2: %3")
-                               .arg(humanPosition)
-                               .arg(preloadQueue_.size())
-                               .arg(item.entry.name));
-        auto* watcher = new QFutureWatcher<ImageDecodeResult>(this);
-        QObject::connect(
-            watcher, &QFutureWatcher<ImageDecodeResult>::finished, this,
-            [this, watcher, generation, position, item, humanPosition]() {
-              const ImageDecodeResult decoded = watcher->result();
-              watcher->deleteLater();
-              if (generation != preloadGeneration_) {
-                return;
-              }
-              if (operationProgressBar_) {
-                operationProgressBar_->setRange(0, preloadQueue_.size());
-                operationProgressBar_->setValue(humanPosition);
-                operationProgressBar_->show();
-              }
-              if (decoded.ok) {
-                setOperationStatus(QString("已预热当前页缓存 %1 / %2: %3")
-                                       .arg(humanPosition)
-                                       .arg(preloadQueue_.size())
-                                       .arg(item.entry.name));
-              } else {
-                setOperationStatus(QString("预热解码失败 %1 / %2: %3")
-                                       .arg(humanPosition)
-                                       .arg(preloadQueue_.size())
-                                       .arg(decoded.message));
-              }
-              preloadNextPageItem(generation, position + 1);
-            });
-        watcher->setFuture(QtConcurrent::run(decodeImageTask, data,
-                                             item.entry.name, item.entry));
+        if (ImageDecoder::isHeifLikeData(data, item.entry.name)) {
+          decodeHeifCache(data);
+          return;
+        }
+
+        complete("原始数据缓存");
       },
       QString("预热读取 %1 / %2 %3")
           .arg(humanPosition)
@@ -1978,7 +2307,8 @@ void MainWindow::refreshStats() {
   prevButton_->setEnabled(currentIndex_ > 0);
   nextButton_->setEnabled(currentIndex_ >= 0 && currentIndex_ < files_.size() - 1);
   saveButton_->setEnabled(classificationMode_ && pending > 0 &&
-                          !submitInProgress_ && !downloadInProgress_);
+                          !submitInProgress_ && !downloadInProgress_ &&
+                          !deleteInProgress_);
   refreshFilePageControls();
 }
 
@@ -2052,13 +2382,15 @@ void MainWindow::onTagSelectionChanged() {
 
 void MainWindow::updateModeControls() {
   const bool connected = client_.hasConnection();
-  const bool busy = submitInProgress_ || downloadInProgress_;
+  const bool busy = submitInProgress_ || downloadInProgress_ || deleteInProgress_;
   browseSourceButton_->setEnabled(connected && !classificationMode_ && !busy);
   browseDownloadPathButton_->setEnabled(!busy);
   downloadCurrentButton_->setEnabled(connected && currentFile() && !busy);
   convertCurrentButton_->setEnabled(connected && currentFile() &&
                                     isImageFileName(currentFile()->entry.name) &&
                                     !busy);
+  deleteCurrentButton_->setEnabled(connected && currentFile() &&
+                                   !currentFile()->submitted && !busy);
   enterModeButton_->setEnabled(connected && !busy);
   enterModeButton_->setText(classificationMode_ ? "退出分类模式" : "进入分类模式");
   sourcePathEdit_->setEnabled(!classificationMode_);

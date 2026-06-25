@@ -1,8 +1,14 @@
 #include "api/openlist_client.h"
 
+#include <QElapsedTimer>
+#include <QHostAddress>
+#include <QHostInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QNetworkReply>
+#include <QSharedPointer>
+
+#include <utility>
 
 namespace {
 
@@ -56,6 +62,30 @@ QJsonObject parseApiResponse(const QByteArray& payload,
   return object;
 }
 
+struct DiagnosticsState {
+  ConnectionDiagnostics diagnostics;
+  int pending{};
+  OpenListClient::DiagnosticsCallback callback;
+
+  void finishOne() {
+    --pending;
+    if (pending <= 0 && callback) {
+      callback(diagnostics);
+    }
+  }
+};
+
+QString valueFromAliases(const QJsonObject& object,
+                         std::initializer_list<const char*> names) {
+  for (const char* name : names) {
+    const QString value = object.value(QString::fromLatin1(name)).toString();
+    if (!value.isEmpty()) {
+      return value;
+    }
+  }
+  return {};
+}
+
 }  // namespace
 
 OpenListClient::OpenListClient(QObject* parent) : QObject(parent) {}
@@ -66,6 +96,11 @@ void OpenListClient::setBaseUrl(const QString& baseUrl) {
 
 void OpenListClient::setToken(const QString& token) {
   token_ = token.trimmed();
+}
+
+void OpenListClient::clearConnection() {
+  baseUrl_.clear();
+  token_.clear();
 }
 
 QString OpenListClient::baseUrl() const {
@@ -115,6 +150,69 @@ void OpenListClient::validateToken(const QString& baseUrl,
                            const QVector<RemoteEntry>&) {
                   callback(ok, ok ? "token 可用" : message);
                 });
+}
+
+void OpenListClient::fetchConnectionDiagnostics(DiagnosticsCallback callback) {
+  ConnectionDiagnostics diagnostics;
+  diagnostics.endpoint = baseUrl_;
+  diagnostics.connected = hasConnection();
+  if (baseUrl_.isEmpty()) {
+    diagnostics.message = "未连接";
+    callback(diagnostics);
+    return;
+  }
+
+  auto state = QSharedPointer<DiagnosticsState>::create();
+  state->diagnostics = diagnostics;
+  state->pending = 2;
+  state->callback = std::move(callback);
+
+  const QUrl url(baseUrl_);
+  const QString host = url.host();
+  if (host.isEmpty()) {
+    state->diagnostics.ipAddress = "未知";
+    state->finishOne();
+  } else {
+    QHostInfo::lookupHost(
+        host, this, [state](const QHostInfo& info) {
+          if (info.error() == QHostInfo::NoError) {
+            const QList<QHostAddress> addresses = info.addresses();
+            if (!addresses.isEmpty()) {
+              state->diagnostics.ipAddress = addresses.first().toString();
+            }
+          }
+          if (state->diagnostics.ipAddress.isEmpty()) {
+            state->diagnostics.ipAddress = "未知";
+          }
+          state->finishOne();
+        });
+  }
+
+  auto timer = QSharedPointer<QElapsedTimer>::create();
+  timer->start();
+  getJson("/api/public/settings",
+          [state, timer](bool ok, const QString& message,
+                         const QJsonObject& data) {
+            state->diagnostics.latencyMs = timer->elapsed();
+            state->diagnostics.publicSettingsOk = ok;
+            state->diagnostics.message = message;
+            if (ok) {
+              state->diagnostics.version =
+                  valueFromAliases(data, {"version", "Version"});
+              state->diagnostics.siteTitle =
+                  valueFromAliases(data, {"site_title", "siteTitle", "title"});
+              if (state->diagnostics.version.isEmpty()) {
+                const QJsonObject settings =
+                    data.value("settings").toObject();
+                state->diagnostics.version =
+                    valueFromAliases(settings, {"version", "Version"});
+                state->diagnostics.siteTitle =
+                    valueFromAliases(settings,
+                                     {"site_title", "siteTitle", "title"});
+              }
+            }
+            state->finishOne();
+          });
 }
 
 void OpenListClient::listDirectory(const QString& path,
@@ -286,6 +384,32 @@ void OpenListClient::postJson(const QString& endpoint,
   QNetworkReply* reply =
       network_.post(makeRequest(endpoint),
                     QJsonDocument(payload).toJson(QJsonDocument::Compact));
+  QObject::connect(reply, &QNetworkReply::finished, this,
+                   [reply, callback]() {
+                     const QByteArray payload = reply->readAll();
+                     if (reply->error() != QNetworkReply::NoError) {
+                       const QString message = reply->errorString();
+                       reply->deleteLater();
+                       callback(false, message, {});
+                       return;
+                     }
+
+                     bool ok = false;
+                     QString message;
+                     QJsonObject data;
+                     parseApiResponse(payload, &ok, &message, &data);
+                     reply->deleteLater();
+                     callback(ok, message, data);
+                   });
+}
+
+void OpenListClient::getJson(const QString& endpoint, JsonCallback callback) {
+  if (baseUrl_.isEmpty()) {
+    callback(false, "OpenList 地址为空", {});
+    return;
+  }
+
+  QNetworkReply* reply = network_.get(makeRequest(endpoint));
   QObject::connect(reply, &QNetworkReply::finished, this,
                    [reply, callback]() {
                      const QByteArray payload = reply->readAll();

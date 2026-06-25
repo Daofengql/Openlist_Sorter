@@ -17,6 +17,8 @@ class ImageDecoder {
  public:
   static ImageDecodeResult decodeToImage(const QByteArray& data,
                                          const QString& sourceName);
+  static bool isHeifLikeData(const QByteArray& data,
+                             const QString& sourceName);
   static QString supportedFormatsSummary();
 };
 

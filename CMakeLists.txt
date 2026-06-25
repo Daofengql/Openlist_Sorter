@@ -41,6 +41,8 @@ add_executable(openlist_sorter
   src/preview/image_converter.h
   src/preview/image_decoder.cpp
   src/preview/image_decoder.h
+  src/preview/jpeg_image_encoder.cpp
+  src/preview/jpeg_image_encoder.h
   src/preview/preview_cache.cpp
   src/preview/preview_cache.h
   src/preview/webp_image_encoder.cpp

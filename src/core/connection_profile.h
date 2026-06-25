@@ -32,8 +32,8 @@ class ConnectionSettingsStore {
  public:
   static ConnectionProfile load();
   static void save(const ConnectionProfile& profile);
+  static void disableAutoLogin();
   static void clearRememberedConnection();
 };
 
 #endif
-

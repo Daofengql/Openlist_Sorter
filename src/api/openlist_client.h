@@ -12,6 +12,17 @@
 
 #include "core/models.h"
 
+struct ConnectionDiagnostics {
+  QString endpoint;
+  bool connected{};
+  bool publicSettingsOk{};
+  qint64 latencyMs{-1};
+  QString ipAddress;
+  QString version;
+  QString siteTitle;
+  QString message;
+};
+
 class OpenListClient : public QObject {
   Q_OBJECT
 
@@ -26,11 +37,14 @@ class OpenListClient : public QObject {
       std::function<void(bool ok, const QString& message, const QByteArray& data)>;
   using DownloadProgressCallback =
       std::function<void(qint64 bytesReceived, qint64 bytesTotal)>;
+  using DiagnosticsCallback =
+      std::function<void(const ConnectionDiagnostics& diagnostics)>;
 
   explicit OpenListClient(QObject* parent = nullptr);
 
   void setBaseUrl(const QString& baseUrl);
   void setToken(const QString& token);
+  void clearConnection();
 
   QString baseUrl() const;
   QString token() const;
@@ -43,6 +57,7 @@ class OpenListClient : public QObject {
   void validateToken(const QString& baseUrl,
                      const QString& token,
                      SimpleCallback callback);
+  void fetchConnectionDiagnostics(DiagnosticsCallback callback);
   void listDirectory(const QString& path,
                      bool refresh,
                      ListCallback callback);
@@ -76,6 +91,7 @@ class OpenListClient : public QObject {
   void postJson(const QString& endpoint,
                 const QJsonObject& payload,
                 JsonCallback callback);
+  void getJson(const QString& endpoint, JsonCallback callback);
   void moveOrCopy(const QString& endpoint,
                   const QString& srcDir,
                   const QString& fileName,

@@ -8,17 +8,25 @@
 #include <QFileInfo>
 #include <QSaveFile>
 
+#include "preview/image_decoder.h"
+#include "preview/jpeg_image_encoder.h"
 #include "preview/webp_image_encoder.h"
 
 namespace {
 
 QString extensionForVariant(const QString& variant) {
-  return variant == "raw" ? ".bin" : ".webp";
+  if (variant == "raw") {
+    return ".bin";
+  }
+  if (variant == "thumb") {
+    return ".webp";
+  }
+  return ".jpg";
 }
 
 QString cacheVersionForVariant(const QString& variant) {
   if (variant == "preview") {
-    return "preview-decode-webp-v1";
+    return "preview-heif-jpeg-v1";
   }
   if (variant == "thumb") {
     return "thumb-webp-v1";
@@ -55,6 +63,19 @@ bool storeBytesToPath(const QString& path, const QByteArray& data) {
   }
   file.write(data);
   return file.commit();
+}
+
+QByteArray encodeThumbnailImage(const QImage& image) {
+  if (image.isNull()) {
+    return {};
+  }
+
+  QByteArray data;
+  QString errorMessage;
+  if (!WebpImageEncoder::encode(image, 90, &data, &errorMessage)) {
+    return {};
+  }
+  return data;
 }
 
 }  // namespace
@@ -113,7 +134,7 @@ QByteArray PreviewCache::encodePreviewImage(const QImage& image) {
 
   QByteArray data;
   QString errorMessage;
-  if (!WebpImageEncoder::encode(image, 100, &data, &errorMessage)) {
+  if (!JpegImageEncoder::encode(image, 100, &data, &errorMessage)) {
     return {};
   }
   return data;
@@ -139,12 +160,12 @@ bool PreviewCache::loadImage(const RemoteEntry& entry,
     return false;
   }
 
-  QImage loaded;
-  QString errorMessage;
-  if (!WebpImageEncoder::decode(data, &loaded, &errorMessage)) {
+  ImageDecodeResult decoded =
+      ImageDecoder::decodeToImage(data, QFileInfo(path).fileName());
+  if (!decoded.ok || decoded.image.isNull()) {
     return false;
   }
-  *image = loaded;
+  *image = decoded.image;
   return true;
 }
 
@@ -233,7 +254,7 @@ bool PreviewCache::storeThumbnail(const RemoteEntry& entry,
   if (!file.open(QIODevice::WriteOnly)) {
     return false;
   }
-  const QByteArray encoded = encodePreviewImage(image);
+  const QByteArray encoded = encodeThumbnailImage(image);
   if (encoded.isEmpty()) {
     file.cancelWriting();
     return false;

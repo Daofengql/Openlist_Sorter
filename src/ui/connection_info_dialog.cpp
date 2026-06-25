@@ -1,10 +1,7 @@
 #include "ui/connection_info_dialog.h"
 
-#include <QDialogButtonBox>
 #include <QFormLayout>
-#include <QHBoxLayout>
 #include <QLabel>
-#include <QPushButton>
 #include <QVBoxLayout>
 
 ConnectionInfoDialog::ConnectionInfoDialog(const QString& endpoint,
@@ -12,7 +9,7 @@ ConnectionInfoDialog::ConnectionInfoDialog(const QString& endpoint,
                                            QWidget* parent)
     : QDialog(parent) {
   setWindowTitle("连接信息");
-  setMinimumWidth(440);
+  setFixedSize(560, 300);
   setModal(true);
 
   auto* root = new QVBoxLayout(this);
@@ -26,28 +23,59 @@ ConnectionInfoDialog::ConnectionInfoDialog(const QString& endpoint,
   auto* form = new QFormLayout();
   auto* endpointLabel = new QLabel(endpoint.isEmpty() ? "未连接" : endpoint);
   endpointLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-  auto* stateLabel = new QLabel(connected ? "已连接" : "未连接");
+  stateLabel_ = new QLabel(connected ? "已连接" : "未连接");
+  latencyLabel_ = new QLabel(connected ? "检测中..." : "未连接");
+  ipLabel_ = new QLabel(connected ? "检测中..." : "未连接");
+  versionLabel_ = new QLabel(connected ? "检测中..." : "未连接");
+  siteTitleLabel_ = new QLabel(connected ? "检测中..." : "未连接");
+  messageLabel_ = new QLabel(" ");
+  messageLabel_->setObjectName("subtleLabel");
+  messageLabel_->setWordWrap(true);
+  ipLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  versionLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  siteTitleLabel_->setTextInteractionFlags(Qt::TextSelectableByMouse);
   form->addRow("Endpoint", endpointLabel);
-  form->addRow("状态", stateLabel);
+  form->addRow("状态", stateLabel_);
+  form->addRow("延迟", latencyLabel_);
+  form->addRow("IP", ipLabel_);
+  form->addRow("远端版本", versionLabel_);
+  form->addRow("站点标题", siteTitleLabel_);
   root->addLayout(form);
-
-  auto* buttonRow = new QHBoxLayout();
-  buttonRow->addStretch(1);
-  auto* reconnectButton = new QPushButton("重新连接...");
-  reconnectButton->setObjectName("primaryButton");
-  auto* closeButton = new QPushButton("关闭");
-  buttonRow->addWidget(closeButton);
-  buttonRow->addWidget(reconnectButton);
-  root->addLayout(buttonRow);
-
-  QObject::connect(closeButton, &QPushButton::clicked, this, &QDialog::reject);
-  QObject::connect(reconnectButton, &QPushButton::clicked, this, [this]() {
-    reconnectRequested_ = true;
-    accept();
-  });
+  root->addWidget(messageLabel_);
 }
 
-bool ConnectionInfoDialog::reconnectRequested() const {
-  return reconnectRequested_;
+void ConnectionInfoDialog::setDiagnostics(
+    const ConnectionDiagnostics& diagnostics) {
+  if (stateLabel_) {
+    stateLabel_->setText(diagnostics.connected ? "已连接" : "未连接");
+  }
+  if (latencyLabel_) {
+    latencyLabel_->setText(diagnostics.latencyMs >= 0
+                               ? QString::number(diagnostics.latencyMs) + " ms"
+                               : "未知");
+  }
+  if (ipLabel_) {
+    ipLabel_->setText(diagnostics.ipAddress.isEmpty()
+                          ? "未知"
+                          : diagnostics.ipAddress);
+  }
+  if (versionLabel_) {
+    versionLabel_->setText(diagnostics.version.isEmpty()
+                               ? "未知"
+                               : diagnostics.version);
+  }
+  if (siteTitleLabel_) {
+    siteTitleLabel_->setText(diagnostics.siteTitle.isEmpty()
+                                 ? "未知"
+                                 : diagnostics.siteTitle);
+  }
+  if (messageLabel_) {
+    if (diagnostics.publicSettingsOk) {
+      messageLabel_->setText("公共设置接口可用。");
+    } else if (!diagnostics.message.isEmpty()) {
+      messageLabel_->setText("公共设置接口不可用: " + diagnostics.message);
+    } else {
+      messageLabel_->setText(" ");
+    }
+  }
 }
-

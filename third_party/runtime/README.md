@@ -16,8 +16,9 @@ third_party/runtime/
 
 The app no longer calls ImageMagick / MagickWand. Runtime image work is routed
 to one implementation per format: WIC for common Windows raster formats,
-libheif for HEIC / HEIF / AVIF, libwebp for WebP decode and encode, and Qt only
-for SVG.
+WIC JPEG encoding for decoded HEIC / HEIF / AVIF cache files, libheif for
+HEIC / HEIF / AVIF decode, libwebp for WebP decode and encode, and Qt only for
+SVG.
 
 The binary payload is intentionally ignored by Git. Put the same relative
 layout here on another Windows machine before configuring a package build.

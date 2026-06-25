@@ -56,6 +56,11 @@ void ConnectionSettingsStore::save(const ConnectionProfile& profile) {
                     profile.autoLogin && profile.hasCredentials());
 }
 
+void ConnectionSettingsStore::disableAutoLogin() {
+  QSettings settings;
+  settings.setValue("connection/autoLogin", false);
+}
+
 void ConnectionSettingsStore::clearRememberedConnection() {
   QSettings settings;
   settings.remove("connection/endpoint");
@@ -66,4 +71,3 @@ void ConnectionSettingsStore::clearRememberedConnection() {
   settings.remove("connection/rememberMe");
   settings.remove("connection/autoLogin");
 }
-
