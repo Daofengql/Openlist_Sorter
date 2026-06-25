@@ -108,6 +108,7 @@ jobs:
           search_dirs=(/mingw64/bin)
 
           declare -A source_dlls=()
+          declare -A existing_dlls=()
           while IFS= read -r source_dll; do
             source_dlls["$(basename "$source_dll" | tr '[:upper:]' '[:lower:]')"]="$source_dll"
           done < <(find "${search_dirs[@]}" -maxdepth 1 -type f -iname '*.dll')
