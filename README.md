@@ -30,14 +30,21 @@ cmake --build build-qt --target openlist_sorter -j 4
 ```text
 third_party/runtime/
   imagemagick/
+    # Windows
     CORE_RL_MagickWand_.dll
     CORE_RL_heif_.dll
     CORE_RL_*.dll
     *.xml
     modules/
+    # Linux release package
+    lib/
+      libMagickWand-*.so*
+      libheif.so*
+    config/
+    modules/
 ```
 
-这些 DLL 不提交到 Git。换机器构建或打包时，把同样结构放到项目目录下即可；CMake 会复制到 `build-qt/dist/runtime`。
+这些非 Qt 运行库不提交到 Git。Windows 换机器构建或打包时，把同样结构放到项目目录下即可；CMake 会复制到 `build-qt/dist/runtime`。Linux release workflow 会从系统包收集 ImageMagick/libheif 运行库、配置和 coder 模块后放入发布包。
 
 构建完成后运行：
 
@@ -47,11 +54,11 @@ third_party/runtime/
 
 ## 图片预览
 
-程序会先使用 Qt5 自带图片解码和 imageformats 插件预览图片。如果 Qt 无法直接读取 HEIC、AVIF、RAW 等格式，会尝试通过项目内的 ImageMagick MagickWand DLL 在内存中转码为 PNG 后显示。
+程序会先使用 Qt5 自带图片解码和 imageformats 插件预览图片。如果 Qt 无法直接读取 HEIC、AVIF、RAW 等格式，会尝试通过 ImageMagick MagickWand 运行库在内存中转码为 PNG 后显示。
 
-如果 ImageMagick 也无法处理，例如遇到扩展名和真实容器不一致、或 HEIC/HEIF 元数据结构异常的图片，程序会绕过 MagickWand，直接复用 `CORE_RL_heif_.dll` 导出的 libheif API 从内存解码主图，并关闭 libheif 默认的容器安全数量限制，避免大图或复杂 tile/grid 图片被 ImageMagick 的策略拦住。
+如果 ImageMagick 也无法处理，例如遇到扩展名和真实容器不一致、或 HEIC/HEIF 元数据结构异常的图片，程序会绕过 MagickWand，直接调用 libheif API 从内存解码主图，并尽量关闭 libheif 默认的容器安全数量限制，避免大图或复杂 tile/grid 图片被 ImageMagick 的策略拦住。
 
-如果项目相对目录下没有 ImageMagick DLL，少见图片格式会退回文件信息页，分类和保存功能不受影响。
+如果没有可用的 ImageMagick/libheif 运行库，少见图片格式会退回文件信息页，分类和保存功能不受影响。
 
 图片预览会缓存到程序运行目录下的 `cache/previews`。程序启动、进入分类模式前和退出时会自动清理这份缓存，避免目录持续膨胀。缓存 key 包含远程路径、大小和修改时间；预览缓存使用满质量 JPG，避免复杂 HEIC/HEIF 解码后生成体积巨大的 PNG。
 

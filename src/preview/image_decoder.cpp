@@ -179,18 +179,18 @@ ImageDecodeResult decodeWithImageMagick(const QByteArray& data,
   if (!MagickWandBridge::decodeToPng(data, &pngData, &errorMessage)) {
     return {false,
             {},
-            "MagickWand DLL 转码失败: " + errorMessage +
+            "MagickWand 运行库转码失败: " + errorMessage +
                 "。Qt 错误: " + qtError,
-            "MagickWand DLL"};
+            "MagickWand 运行库"};
   }
 
   QImage image = QImage::fromData(pngData, "PNG");
   if (image.isNull()) {
     return {false, {}, "MagickWand 已输出 PNG，但 Qt 无法读取结果。",
-            "MagickWand DLL"};
+            "MagickWand 运行库"};
   }
 
-  return {true, image, "MagickWand DLL 内存转码", "MagickWand DLL"};
+  return {true, image, "MagickWand 运行库内存转码", "MagickWand 运行库"};
 }
 
 }  // namespace

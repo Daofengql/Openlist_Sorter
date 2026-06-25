@@ -31,7 +31,7 @@ ImageConversionResult ImageConverter::convertToWebp(
 
   QString errorMessage;
   if (!MagickWandBridge::convertToWebp(data, &result.data, &errorMessage)) {
-    result.message = "MagickWand DLL 转 WebP 失败: " + errorMessage;
+    result.message = "MagickWand 运行库转 WebP 失败: " + errorMessage;
     return result;
   }
   result.ok = !result.data.isEmpty();

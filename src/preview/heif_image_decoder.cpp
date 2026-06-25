@@ -1,5 +1,6 @@
 #include "preview/heif_image_decoder.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QImage>
@@ -65,11 +66,70 @@ bool isOk(const heif_error& error) {
 }
 
 ImageDecodeResult makeFailure(const QString& message) {
-  return {false, {}, message, "libheif DLL"};
+  return {false, {}, message, "libheif"};
+}
+
+void appendUnique(QStringList* values, const QString& value) {
+  if (!value.isEmpty() && !values->contains(value)) {
+    values->push_back(value);
+  }
+}
+
+void appendLibraryFiles(QStringList* candidates,
+                        const QString& directoryPath,
+                        const QStringList& filters) {
+  const QDir directory(directoryPath);
+  if (!directory.exists()) {
+    return;
+  }
+  const QFileInfoList entries =
+      directory.entryInfoList(filters, QDir::Files, QDir::Name);
+  for (const QFileInfo& entry : entries) {
+    appendUnique(candidates, entry.absoluteFilePath());
+  }
+}
+
+QStringList heifLibraryCandidates(const QString& runtimeDir) {
+  QStringList candidates;
+#ifdef Q_OS_WIN
+  if (!runtimeDir.isEmpty()) {
+    appendUnique(&candidates, QDir(runtimeDir).filePath("CORE_RL_heif_.dll"));
+  }
+#else
+  const QStringList filters = {
+      "libheif.so*",
+  };
+  if (!runtimeDir.isEmpty()) {
+    appendLibraryFiles(&candidates, QDir(runtimeDir).filePath("lib"), filters);
+    appendLibraryFiles(&candidates, runtimeDir, filters);
+  }
+
+  const QStringList systemLibraryDirs = {
+      QCoreApplication::applicationDirPath(),
+      "/usr/lib/x86_64-linux-gnu",
+      "/lib/x86_64-linux-gnu",
+      "/usr/lib64",
+      "/usr/lib",
+      "/lib64",
+      "/lib",
+  };
+  for (const QString& directory : systemLibraryDirs) {
+    appendLibraryFiles(&candidates, directory, filters);
+  }
+
+  appendUnique(&candidates, "heif");
+#endif
+  return candidates;
 }
 
 class HeifApi {
  public:
+  ~HeifApi() {
+    if (loaded_ && heif_deinit_) {
+      heif_deinit_();
+    }
+  }
+
   bool ensureLoaded(QString* errorMessage) {
     QMutexLocker locker(&mutex_);
     if (loaded_) {
@@ -84,52 +144,55 @@ class HeifApi {
     attempted_ = true;
 
     const QString runtimeDir = RuntimePaths::runtimeDirectory("imagemagick");
-    if (runtimeDir.isEmpty()) {
-      loadError_ =
-          "未找到 ImageMagick DLL 目录 runtime/imagemagick 或 "
-          "third_party/runtime/imagemagick，无法复用其中的 libheif。";
-      if (errorMessage) {
-        *errorMessage = loadError_;
-      }
-      return false;
+    if (!runtimeDir.isEmpty()) {
+      RuntimePaths::addDllSearchPath(runtimeDir);
+      RuntimePaths::addDllSearchPath(QDir(runtimeDir).filePath("lib"));
     }
 
-    const QString heifPath = QDir(runtimeDir).filePath("CORE_RL_heif_.dll");
-    if (!QFileInfo::exists(heifPath)) {
-      loadError_ = "ImageMagick 目录缺少 CORE_RL_heif_.dll: " +
-                   QDir::toNativeSeparators(runtimeDir);
-      if (errorMessage) {
-        *errorMessage = loadError_;
+    const QStringList candidates = heifLibraryCandidates(runtimeDir);
+    QStringList loadErrors;
+    for (const QString& candidate : candidates) {
+      library_.setFileName(candidate);
+      if (!library_.load()) {
+        loadErrors.push_back(candidate + ": " + library_.errorString());
+        continue;
       }
-      return false;
-    }
 
-    RuntimePaths::addDllSearchPath(runtimeDir);
-    library_.setFileName(heifPath);
-    if (!library_.load()) {
-      loadError_ = "加载 CORE_RL_heif_.dll 失败: " + library_.errorString();
-      if (errorMessage) {
-        *errorMessage = loadError_;
+      QString symbolError;
+      if (resolveAll(&symbolError)) {
+        loadedLibraryName_ = candidate;
+        break;
       }
-      return false;
-    }
 
-    if (!resolveAll(&loadError_)) {
+      loadErrors.push_back(candidate + ": " + symbolError);
       library_.unload();
+    }
+
+    if (!library_.isLoaded()) {
+      loadError_ = "加载 libheif 运行库失败。";
+      if (runtimeDir.isEmpty()) {
+        loadError_ += " 未找到 runtime/imagemagick 或 "
+                      "third_party/runtime/imagemagick。";
+      }
+      if (!loadErrors.isEmpty()) {
+        loadError_ += " 尝试结果: " + loadErrors.join(" | ");
+      }
       if (errorMessage) {
         *errorMessage = loadError_;
       }
       return false;
     }
 
-    const heif_error initError = heif_init_(nullptr);
-    if (!isOk(initError)) {
-      loadError_ = "初始化 libheif 失败: " + errorText(initError);
-      library_.unload();
-      if (errorMessage) {
-        *errorMessage = loadError_;
+    if (heif_init_) {
+      const heif_error initError = heif_init_(nullptr);
+      if (!isOk(initError)) {
+        loadError_ = "初始化 libheif 失败: " + errorText(initError);
+        library_.unload();
+        if (errorMessage) {
+          *errorMessage = loadError_;
+        }
+        return false;
       }
-      return false;
     }
 
     loaded_ = true;
@@ -163,6 +226,8 @@ class HeifApi {
   using HeifImageGetPlaneReadonlyFunc =
       const unsigned char* (*)(const heif_image*, heif_channel, int*);
   using HeifImageReleaseFunc = void (*)(const heif_image*);
+  using HeifImageGetWidthFunc = int (*)(const heif_image*, heif_channel);
+  using HeifImageGetHeightFunc = int (*)(const heif_image*, heif_channel);
 
   HeifInitFunc heif_init_{};
   HeifDeinitFunc heif_deinit_{};
@@ -185,6 +250,8 @@ class HeifApi {
   HeifImageGetPrimaryHeightFunc heif_image_get_primary_height_{};
   HeifImageGetPlaneReadonlyFunc heif_image_get_plane_readonly_{};
   HeifImageReleaseFunc heif_image_release_{};
+  HeifImageGetWidthFunc heif_image_get_width_{};
+  HeifImageGetHeightFunc heif_image_get_height_{};
 
  private:
   bool resolveAll(QString* errorMessage) {
@@ -192,31 +259,57 @@ class HeifApi {
   do {                                                                        \
     name##_ = reinterpret_cast<decltype(name##_)>(library_.resolve(#name));   \
     if (!name##_) {                                                           \
-      *errorMessage = QString("CORE_RL_heif_.dll 缺少符号: ") + #name;       \
+      *errorMessage = QString("libheif 运行库缺少符号: ") + #name;         \
       return false;                                                           \
     }                                                                         \
   } while (false)
 
-    RESOLVE_HEIF_SYMBOL(heif_init);
-    RESOLVE_HEIF_SYMBOL(heif_deinit);
     RESOLVE_HEIF_SYMBOL(heif_get_version);
     RESOLVE_HEIF_SYMBOL(heif_context_alloc);
     RESOLVE_HEIF_SYMBOL(heif_context_free);
     RESOLVE_HEIF_SYMBOL(heif_context_read_from_memory_without_copy);
     RESOLVE_HEIF_SYMBOL(heif_context_get_primary_image_handle);
-    RESOLVE_HEIF_SYMBOL(heif_context_set_security_limits);
-    RESOLVE_HEIF_SYMBOL(heif_context_set_maximum_image_size_limit);
-    RESOLVE_HEIF_SYMBOL(heif_get_disabled_security_limits);
     RESOLVE_HEIF_SYMBOL(heif_image_handle_get_width);
     RESOLVE_HEIF_SYMBOL(heif_image_handle_get_height);
     RESOLVE_HEIF_SYMBOL(heif_image_handle_release);
     RESOLVE_HEIF_SYMBOL(heif_decode_image);
-    RESOLVE_HEIF_SYMBOL(heif_image_get_primary_width);
-    RESOLVE_HEIF_SYMBOL(heif_image_get_primary_height);
     RESOLVE_HEIF_SYMBOL(heif_image_get_plane_readonly);
     RESOLVE_HEIF_SYMBOL(heif_image_release);
 
 #undef RESOLVE_HEIF_SYMBOL
+
+    heif_init_ = reinterpret_cast<HeifInitFunc>(library_.resolve("heif_init"));
+    heif_deinit_ =
+        reinterpret_cast<HeifDeinitFunc>(library_.resolve("heif_deinit"));
+    heif_context_set_security_limits_ =
+        reinterpret_cast<HeifContextSetSecurityLimitsFunc>(
+            library_.resolve("heif_context_set_security_limits"));
+    heif_context_set_maximum_image_size_limit_ =
+        reinterpret_cast<HeifContextSetMaximumImageSizeLimitFunc>(
+            library_.resolve("heif_context_set_maximum_image_size_limit"));
+    heif_get_disabled_security_limits_ =
+        reinterpret_cast<HeifGetDisabledSecurityLimitsFunc>(
+            library_.resolve("heif_get_disabled_security_limits"));
+    heif_image_get_width_ =
+        reinterpret_cast<HeifImageGetWidthFunc>(
+            library_.resolve("heif_image_get_width"));
+    heif_image_get_height_ =
+        reinterpret_cast<HeifImageGetHeightFunc>(
+            library_.resolve("heif_image_get_height"));
+    heif_image_get_primary_width_ =
+        reinterpret_cast<HeifImageGetPrimaryWidthFunc>(
+            library_.resolve("heif_image_get_primary_width"));
+    heif_image_get_primary_height_ =
+        reinterpret_cast<HeifImageGetPrimaryHeightFunc>(
+            library_.resolve("heif_image_get_primary_height"));
+    if ((!heif_image_get_primary_width_ || !heif_image_get_primary_height_) &&
+        (!heif_image_get_width_ || !heif_image_get_height_)) {
+      *errorMessage =
+          "libheif 运行库缺少图像尺寸符号: heif_image_get_primary_width/"
+          "heif_image_get_primary_height 或 heif_image_get_width/"
+          "heif_image_get_height";
+      return false;
+    }
     return true;
   }
 
@@ -225,6 +318,7 @@ class HeifApi {
   bool attempted_{};
   bool loaded_{};
   QString loadError_;
+  QString loadedLibraryName_;
 };
 
 HeifApi& heifApi() {
@@ -302,7 +396,7 @@ ImageDecodeResult decodeWithLibheif(const QByteArray& data,
   HeifApi& api = heifApi();
   QString loadError;
   if (!api.ensureLoaded(&loadError)) {
-    return makeFailure("Qt 和 MagickWand 都无法解码该图片，且 libheif DLL "
+    return makeFailure("Qt 和 MagickWand 都无法解码该图片，且 libheif "
                        "不可用: " +
                        loadError + "。Qt 错误: " + qtError +
                        "。MagickWand 错误: " + imageMagickError);
@@ -318,14 +412,16 @@ ImageDecodeResult decodeWithLibheif(const QByteArray& data,
   }
 
   const heif_security_limits* disabledLimits =
-      api.heif_get_disabled_security_limits_();
-  if (disabledLimits) {
+      api.heif_get_disabled_security_limits_
+          ? api.heif_get_disabled_security_limits_()
+          : nullptr;
+  if (disabledLimits && api.heif_context_set_security_limits_) {
     const heif_error limitError =
         api.heif_context_set_security_limits_(context.get(), disabledLimits);
     if (!isOk(limitError)) {
       return makeFailure("libheif 设置安全限制失败: " + errorText(limitError));
     }
-  } else {
+  } else if (api.heif_context_set_maximum_image_size_limit_) {
     api.heif_context_set_maximum_image_size_limit_(context.get(), 65535);
   }
 
@@ -359,8 +455,18 @@ ImageDecodeResult decodeWithLibheif(const QByteArray& data,
   }
   ScopedHeifImage decoded(&api, rawImage);
 
-  const int width = api.heif_image_get_primary_width_(decoded.get());
-  const int height = api.heif_image_get_primary_height_(decoded.get());
+  const int width = api.heif_image_get_primary_width_
+                        ? api.heif_image_get_primary_width_(decoded.get())
+                        : (api.heif_image_get_width_
+                               ? api.heif_image_get_width_(
+                                     decoded.get(), heif_channel_interleaved)
+                               : expectedWidth);
+  const int height = api.heif_image_get_primary_height_
+                         ? api.heif_image_get_primary_height_(decoded.get())
+                         : (api.heif_image_get_height_
+                                ? api.heif_image_get_height_(
+                                      decoded.get(), heif_channel_interleaved)
+                                : expectedHeight);
   if (width <= 0 || height <= 0) {
     return makeFailure("libheif 解码后图像尺寸无效。");
   }
@@ -392,7 +498,7 @@ ImageDecodeResult decodeWithLibheif(const QByteArray& data,
 
   const char* version = api.heif_get_version_();
   const QString decoder =
-      QString("libheif DLL%1 (%2x%3)")
+      QString("libheif%1 (%2x%3)")
           .arg(version ? QString(" ") + QString::fromUtf8(version) : QString())
           .arg(width)
           .arg(height);

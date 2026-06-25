@@ -1,10 +1,12 @@
 #include "preview/magick_wand_bridge.h"
 
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QLibrary>
 #include <QMutex>
 #include <QMutexLocker>
+#include <QStringList>
 
 #include "core/runtime_paths.h"
 
@@ -13,6 +15,117 @@ namespace {
 using MagickBooleanType = int;
 using ExceptionType = int;
 using MagickWand = void;
+
+void appendUnique(QStringList* values, const QString& value) {
+  if (!value.isEmpty() && !values->contains(value)) {
+    values->push_back(value);
+  }
+}
+
+void appendLibraryFiles(QStringList* candidates,
+                        const QString& directoryPath,
+                        const QStringList& filters) {
+  const QDir directory(directoryPath);
+  if (!directory.exists()) {
+    return;
+  }
+  const QFileInfoList entries =
+      directory.entryInfoList(filters, QDir::Files, QDir::Name);
+  for (const QFileInfo& entry : entries) {
+    appendUnique(candidates, entry.absoluteFilePath());
+  }
+}
+
+QString firstExistingDirectory(const QStringList& candidates) {
+  for (const QString& candidate : candidates) {
+    const QFileInfo info(candidate);
+    if (info.exists() && info.isDir()) {
+      return info.absoluteFilePath();
+    }
+  }
+  return {};
+}
+
+void prepareImageMagickEnvironment(const QString& runtimeDir) {
+  if (runtimeDir.isEmpty()) {
+    return;
+  }
+
+  RuntimePaths::addDllSearchPath(runtimeDir);
+  RuntimePaths::addDllSearchPath(QDir(runtimeDir).filePath("lib"));
+
+  qputenv("MAGICK_HOME", QDir::toNativeSeparators(runtimeDir).toLocal8Bit());
+
+  const QString configurePath = firstExistingDirectory({
+      QDir(runtimeDir).filePath("config"),
+      runtimeDir,
+  });
+  if (!configurePath.isEmpty()) {
+    qputenv("MAGICK_CONFIGURE_PATH",
+            QDir::toNativeSeparators(configurePath).toLocal8Bit());
+  }
+
+  const QString coderPath = firstExistingDirectory({
+      QDir(runtimeDir).filePath("modules/coders"),
+      QDir(runtimeDir).filePath("modules-Q16/coders"),
+  });
+  if (!coderPath.isEmpty()) {
+    qputenv("MAGICK_CODER_MODULE_PATH",
+            QDir::toNativeSeparators(coderPath).toLocal8Bit());
+  }
+
+  const QString filterPath = firstExistingDirectory({
+      QDir(runtimeDir).filePath("modules/filters"),
+      QDir(runtimeDir).filePath("modules-Q16/filters"),
+  });
+  if (!filterPath.isEmpty()) {
+    qputenv("MAGICK_FILTER_MODULE_PATH",
+            QDir::toNativeSeparators(filterPath).toLocal8Bit());
+  }
+}
+
+QStringList magickWandLibraryCandidates(const QString& runtimeDir) {
+  QStringList candidates;
+#ifdef Q_OS_WIN
+  if (!runtimeDir.isEmpty()) {
+    appendUnique(&candidates, QDir(runtimeDir).filePath("CORE_RL_MagickWand_.dll"));
+  }
+#else
+  const QStringList filters = {
+      "libMagickWand-7*.so*",
+      "libMagickWand-6*.so*",
+      "libMagickWand*.so*",
+  };
+  if (!runtimeDir.isEmpty()) {
+    appendLibraryFiles(&candidates, QDir(runtimeDir).filePath("lib"), filters);
+    appendLibraryFiles(&candidates, runtimeDir, filters);
+  }
+
+  const QStringList systemLibraryDirs = {
+      QCoreApplication::applicationDirPath(),
+      "/usr/lib/x86_64-linux-gnu",
+      "/lib/x86_64-linux-gnu",
+      "/usr/lib64",
+      "/usr/lib",
+      "/lib64",
+      "/lib",
+  };
+  for (const QString& directory : systemLibraryDirs) {
+    appendLibraryFiles(&candidates, directory, filters);
+  }
+
+  for (const QString& libraryName : {
+           "MagickWand-7.Q16HDRI",
+           "MagickWand-7.Q16",
+           "MagickWand-6.Q16HDRI",
+           "MagickWand-6.Q16",
+           "MagickWand",
+       }) {
+    appendUnique(&candidates, libraryName);
+  }
+#endif
+  return candidates;
+}
 
 class MagickWandApi {
  public:
@@ -36,50 +149,36 @@ class MagickWandApi {
     attempted_ = true;
 
     const QString runtimeDir = RuntimePaths::runtimeDirectory("imagemagick");
-    if (runtimeDir.isEmpty()) {
-      loadError_ =
-          "未找到 ImageMagick DLL 目录 runtime/imagemagick 或 "
-          "third_party/runtime/imagemagick。";
-      if (errorMessage) {
-        *errorMessage = loadError_;
+    prepareImageMagickEnvironment(runtimeDir);
+
+    const QStringList candidates = magickWandLibraryCandidates(runtimeDir);
+    QStringList loadErrors;
+    for (const QString& candidate : candidates) {
+      library_.setFileName(candidate);
+      if (!library_.load()) {
+        loadErrors.push_back(candidate + ": " + library_.errorString());
+        continue;
       }
-      return false;
-    }
 
-    const QString wandPath =
-        QDir(runtimeDir).filePath("CORE_RL_MagickWand_.dll");
-    if (!QFileInfo::exists(wandPath)) {
-      loadError_ = "ImageMagick 目录缺少 CORE_RL_MagickWand_.dll: " +
-                   QDir::toNativeSeparators(runtimeDir);
-      if (errorMessage) {
-        *errorMessage = loadError_;
+      QString symbolError;
+      if (resolveAll(&symbolError)) {
+        loadedLibraryName_ = candidate;
+        break;
       }
-      return false;
-    }
 
-    RuntimePaths::addDllSearchPath(runtimeDir);
-    qputenv("MAGICK_HOME", QDir::toNativeSeparators(runtimeDir).toLocal8Bit());
-    qputenv("MAGICK_CONFIGURE_PATH",
-            QDir::toNativeSeparators(runtimeDir).toLocal8Bit());
-    qputenv("MAGICK_CODER_MODULE_PATH",
-            QDir::toNativeSeparators(QDir(runtimeDir).filePath("modules/coders"))
-                .toLocal8Bit());
-    qputenv("MAGICK_FILTER_MODULE_PATH",
-            QDir::toNativeSeparators(
-                QDir(runtimeDir).filePath("modules/filters"))
-                .toLocal8Bit());
-
-    library_.setFileName(wandPath);
-    if (!library_.load()) {
-      loadError_ = "加载 ImageMagick DLL 失败: " + library_.errorString();
-      if (errorMessage) {
-        *errorMessage = loadError_;
-      }
-      return false;
-    }
-
-    if (!resolveAll(&loadError_)) {
+      loadErrors.push_back(candidate + ": " + symbolError);
       library_.unload();
+    }
+
+    if (!library_.isLoaded()) {
+      loadError_ = "加载 ImageMagick 运行库失败。";
+      if (runtimeDir.isEmpty()) {
+        loadError_ += " 未找到 runtime/imagemagick 或 "
+                      "third_party/runtime/imagemagick。";
+      }
+      if (!loadErrors.isEmpty()) {
+        loadError_ += " 尝试结果: " + loadErrors.join(" | ");
+      }
       if (errorMessage) {
         *errorMessage = loadError_;
       }
@@ -178,7 +277,7 @@ class MagickWandApi {
   do {                                                                        \
     name##_ = reinterpret_cast<name##Func>(library_.resolve(#name));          \
     if (!name##_) {                                                           \
-      *errorMessage = QString("ImageMagick DLL 缺少符号: ") + #name;         \
+      *errorMessage = QString("ImageMagick 运行库缺少符号: ") + #name;     \
       return false;                                                           \
     }                                                                         \
   } while (false)
@@ -221,6 +320,7 @@ class MagickWandApi {
   bool attempted_{};
   bool loaded_{};
   QString loadError_;
+  QString loadedLibraryName_;
 
   MagickWandGenesisFunc MagickWandGenesis_{};
   MagickWandTerminusFunc MagickWandTerminus_{};

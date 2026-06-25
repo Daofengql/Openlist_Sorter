@@ -128,7 +128,12 @@ jobs:
           sudo apt-get install -y \
             build-essential \
             cmake \
+            imagemagick \
             libgl1-mesa-dev \
+            libheif1 \
+            libmagickcore-6.q16-6-extra \
+            libmagickwand-6.q16-6 \
+            libpulse-dev \
             ninja-build \
             patchelf \
             python3-pip
@@ -160,11 +165,99 @@ jobs:
               cp -a "$QT_ROOT/plugins/$plugin_dir" "$package_dir/"
             fi
           done
+
+          im_runtime="$package_dir/runtime/imagemagick"
+          im_lib="$im_runtime/lib"
+          im_config="$im_runtime/config"
+          im_coders="$im_runtime/modules/coders"
+          im_filters="$im_runtime/modules/filters"
+          mkdir -p "$im_lib" "$im_config" "$im_coders" "$im_filters"
+
+          find_ldconfig_library() {
+            ldconfig -p | awk -v pattern="$1" '$1 ~ pattern { print $NF; exit }'
+          }
+
+          skip_system_dependency() {
+            case "$(basename "$1")" in
+              ld-linux*|linux-vdso*|libBrokenLocale.so.*|libanl.so.*|libc.so.*|libdl.so.*|libm.so.*|libmvec.so.*|libnsl.so.*|libnss_*|libpthread.so.*|libresolv.so.*|librt.so.*|libutil.so.*)
+                return 0
+                ;;
+            esac
+            return 1
+          }
+
+          copy_library_file() {
+            local src="$1"
+            [ -e "$src" ] || return 0
+            local real
+            real="$(readlink -f "$src")"
+            cp -L "$src" "$im_lib/$(basename "$src")"
+            if [ "$(basename "$real")" != "$(basename "$src")" ]; then
+              cp -L "$real" "$im_lib/$(basename "$real")"
+            fi
+          }
+
+          copy_library_tree() {
+            local queue=("$@")
+            local item real dep
+            declare -A seen=()
+            while [ "${#queue[@]}" -gt 0 ]; do
+              item="${queue[0]}"
+              queue=("${queue[@]:1}")
+              [ -e "$item" ] || continue
+              real="$(readlink -f "$item")"
+              [ -n "${seen[$real]:-}" ] && continue
+              seen[$real]=1
+              if skip_system_dependency "$real"; then
+                continue
+              fi
+              copy_library_file "$item"
+              while IFS= read -r dep; do
+                [ -n "$dep" ] && queue+=("$dep")
+              done < <(ldd "$real" 2>/dev/null | awk '/=> \// { print $3 } /^\t\// { print $1 }')
+            done
+          }
+
+          magick_wand_lib="$(find_ldconfig_library '^libMagickWand-.*\.so')"
+          magick_core_lib="$(find_ldconfig_library '^libMagickCore-.*\.so')"
+          heif_lib="$(find_ldconfig_library '^libheif\.so')"
+          pulse_lib="$(find_ldconfig_library '^libpulse\.so')"
+          pulse_glib_lib="$(find_ldconfig_library '^libpulse-mainloop-glib\.so')"
+          if [ -z "$magick_wand_lib" ] || [ -z "$magick_core_lib" ] || [ -z "$heif_lib" ]; then
+            echo "Missing Linux ImageMagick/libheif runtime libraries."
+            ldconfig -p | grep -E 'Magick(Wand|Core)|libheif' || true
+            exit 1
+          fi
+          copy_library_tree "$magick_wand_lib" "$magick_core_lib" "$heif_lib" "$pulse_lib" "$pulse_glib_lib"
+
+          for config_dir in /etc/ImageMagick-7 /etc/ImageMagick-6; do
+            if [ -d "$config_dir" ]; then
+              cp -a "$config_dir"/*.xml "$im_config/" 2>/dev/null || true
+            fi
+          done
+
+          coder_dir="$(find /usr/lib /lib -type d -path '*ImageMagick*modules*coders' -print -quit 2>/dev/null || true)"
+          if [ -z "$coder_dir" ]; then
+            echo "Missing ImageMagick coder module directory."
+            exit 1
+          fi
+          cp -a "$coder_dir"/*.so "$im_coders/"
+
+          filter_dir="$(find /usr/lib /lib -type d -path '*ImageMagick*modules*filters' -print -quit 2>/dev/null || true)"
+          if [ -n "$filter_dir" ]; then
+            cp -a "$filter_dir"/*.so "$im_filters/" 2>/dev/null || true
+          fi
+
+          copy_library_tree "$im_coders"/*.so "$im_filters"/*.so
+          test -f "$im_coders/heic.so" || { echo "Missing ImageMagick heic coder module."; ls -la "$im_coders"; exit 1; }
+          test -f "$im_coders/webp.so" || { echo "Missing ImageMagick webp coder module."; ls -la "$im_coders"; exit 1; }
+          echo "Prepared Linux ImageMagick runtime: $(find "$im_lib" -maxdepth 1 -type f | wc -l) libraries, $(find "$im_coders" -maxdepth 1 -type f | wc -l) coder modules."
+
           cat > "$package_dir/OpenListSorter.sh" <<'EOF'
           #!/usr/bin/env bash
           set -e
           app_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-          export LD_LIBRARY_PATH="$app_dir:${LD_LIBRARY_PATH:-}"
+          export LD_LIBRARY_PATH="$app_dir:$app_dir/runtime/imagemagick/lib:${LD_LIBRARY_PATH:-}"
           export QT_PLUGIN_PATH="$app_dir"
           exec "$app_dir/OpenListSorter" "$@"
           EOF
