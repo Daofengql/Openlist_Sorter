@@ -158,7 +158,7 @@ ImageConversionResult convertImageToWebpTask(const QByteArray& data,
   }
 
   ImageConversionResult cachedResult = ImageConverter::convertToWebp(
-      previewData, QFileInfo(fileName).completeBaseName() + ".jpg", "解码缓存");
+      previewData, QFileInfo(fileName).completeBaseName() + ".webp", "解码缓存");
   if (!cachedResult.ok) {
     cachedResult.message =
         "原始文件转 WebP 失败: " + rawResult.message +

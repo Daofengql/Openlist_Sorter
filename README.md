@@ -29,22 +29,15 @@ cmake --build build-qt --target openlist_sorter -j 4
 
 ```text
 third_party/runtime/
-  imagemagick/
+  imagecodecs/
     # Windows
-    CORE_RL_MagickWand_.dll
     CORE_RL_heif_.dll
-    CORE_RL_*.dll
-    *.xml
-    modules/
-    # Linux release package
-    lib/
-      libMagickWand-*.so*
-      libheif.so*
-    config/
-    modules/
+    CORE_RL_webp_.dll
+    CORE_RL_brotli_.dll
+    CORE_RL_zlib_.dll
 ```
 
-这些非 Qt 运行库不提交到 Git。Windows 换机器构建或打包时，把同样结构放到项目目录下即可；CMake 会复制到 `build-qt/dist/runtime`。Linux release workflow 会从系统包收集 ImageMagick/libheif 运行库、配置和 coder 模块后放入发布包。
+这些非 Qt 运行库不提交到 Git。Windows 换机器构建或打包时，把同样结构放到项目目录下即可；CMake 会复制到 `build-qt/dist/runtime/imagecodecs`。程序不再调用 ImageMagick/MagickWand 中间层。为了减少包体，`msvcp140*.dll` / `vcruntime140*.dll` 不再随包携带；干净系统如果无法加载 HEIF/WebP 运行库，安装 Microsoft Visual C++ 2015-2022 x64 Redistributable 即可。
 
 构建完成后运行：
 
@@ -54,13 +47,11 @@ third_party/runtime/
 
 ## 图片预览
 
-程序会先使用 Qt5 自带图片解码和 imageformats 插件预览图片。如果 Qt 无法直接读取 HEIC、AVIF、RAW 等格式，会尝试通过 ImageMagick MagickWand 运行库在内存中转码为 PNG 后显示。
+图片解码按格式只走一条路径，避免同一格式同时打包多套库。Windows 上 JPG/PNG/BMP/GIF/TIFF/ICO 交给系统 WIC；WebP 解码和 WebP 输出交给 libwebp；HEIC/HEIF/AVIF 交给 libheif，并尽量关闭 libheif 默认的容器安全数量限制，避免大图或复杂 tile/grid 图片被策略拦住；SVG/SVGZ 继续使用 Qt SVG。
 
-如果 ImageMagick 也无法处理，例如遇到扩展名和真实容器不一致、或 HEIC/HEIF 元数据结构异常的图片，程序会绕过 MagickWand，直接调用 libheif API 从内存解码主图，并尽量关闭 libheif 默认的容器安全数量限制，避免大图或复杂 tile/grid 图片被 ImageMagick 的策略拦住。
+如果某种格式没有可用的底层解码器，预览会退回文件信息页，分类和保存功能不受影响。
 
-如果没有可用的 ImageMagick/libheif 运行库，少见图片格式会退回文件信息页，分类和保存功能不受影响。
-
-图片预览会缓存到程序运行目录下的 `cache/previews`。程序启动、进入分类模式前和退出时会自动清理这份缓存，避免目录持续膨胀。缓存 key 包含远程路径、大小和修改时间；预览缓存使用满质量 JPG，避免复杂 HEIC/HEIF 解码后生成体积巨大的 PNG。
+图片预览会缓存到程序运行目录下的 `cache/previews`。程序启动、进入分类模式前和退出时会自动清理这份缓存，避免目录持续膨胀。缓存 key 包含远程路径、大小和修改时间；预览缓存使用 libwebp 写入 WebP，避免通过 Qt JPG/WEBP 插件重复引入格式库。
 
 如果 OpenList/Alist 返回了图片缩略图，程序会先尝试加载并缓存缩略图；缩略图尺寸足够时直接用于预览，尺寸不足时再下载原图解码。
 

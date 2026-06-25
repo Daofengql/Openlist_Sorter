@@ -9,7 +9,8 @@
 #include <QImageReader>
 
 #include "preview/heif_image_decoder.h"
-#include "preview/magick_wand_bridge.h"
+#include "preview/webp_image_encoder.h"
+#include "preview/wic_image_decoder.h"
 
 namespace {
 
@@ -62,6 +63,9 @@ QString detectedSuffixForData(const QByteArray& data,
   if (dataStartsWith(data, "BM")) {
     return "bmp";
   }
+  if (dataStartsWith(data, QByteArray::fromHex("00000100"))) {
+    return "ico";
+  }
   if (data.size() >= 12 && data.left(4) == "RIFF" && data.mid(8, 4) == "WEBP") {
     return "webp";
   }
@@ -98,21 +102,20 @@ bool shouldCompareContainerDecoders(const QByteArray& data,
   return suffix == "heic" || suffix == "heif" || suffix == "avif";
 }
 
-qint64 imageArea(const QImage& image) {
-  if (image.isNull()) {
-    return 0;
-  }
-  return static_cast<qint64>(image.width()) * image.height();
+bool shouldDecodeWithWebp(const QByteArray& data, const QString& sourceName) {
+  return detectedSuffixForData(data, sourceName) == "webp";
 }
 
-void keepLargerImage(ImageDecodeResult* best,
-                     const ImageDecodeResult& candidate) {
-  if (!candidate.ok) {
-    return;
-  }
-  if (!best->ok || imageArea(candidate.image) > imageArea(best->image)) {
-    *best = candidate;
-  }
+bool shouldDecodeWithQt(const QByteArray& data, const QString& sourceName) {
+  const QString suffix = detectedSuffixForData(data, sourceName);
+  return suffix == "svg" || suffix == "svgz";
+}
+
+bool shouldDecodeWithWic(const QByteArray& data, const QString& sourceName) {
+  const QString suffix = detectedSuffixForData(data, sourceName);
+  return suffix == "jpg" || suffix == "jpeg" || suffix == "png" ||
+         suffix == "gif" || suffix == "bmp" || suffix == "tif" ||
+         suffix == "tiff" || suffix == "ico";
 }
 
 QString safeDiagnosticName(const QString& sourceName, const QString& suffix) {
@@ -169,93 +172,110 @@ ImageDecodeResult decodeWithQt(const QByteArray& data,
   return {true, image, "Qt ImageReader", "Qt ImageReader"};
 }
 
-ImageDecodeResult decodeWithImageMagick(const QByteArray& data,
-                                        const QString& sourceName,
-                                        const QString& qtError) {
-  Q_UNUSED(sourceName);
-
-  QByteArray pngData;
+ImageDecodeResult decodeWithWebp(const QByteArray& data) {
+  QImage image;
   QString errorMessage;
-  if (!MagickWandBridge::decodeToPng(data, &pngData, &errorMessage)) {
-    return {false,
-            {},
-            "MagickWand 运行库转码失败: " + errorMessage +
-                "。Qt 错误: " + qtError,
-            "MagickWand 运行库"};
+  if (!WebpImageEncoder::decode(data, &image, &errorMessage)) {
+    return {false, {}, "libwebp 解码失败: " + errorMessage, "libwebp"};
   }
 
-  QImage image = QImage::fromData(pngData, "PNG");
-  if (image.isNull()) {
-    return {false, {}, "MagickWand 已输出 PNG，但 Qt 无法读取结果。",
-            "MagickWand 运行库"};
-  }
-
-  return {true, image, "MagickWand 运行库内存转码", "MagickWand 运行库"};
+  return {true, image, "libwebp 直接解码", "libwebp"};
 }
 
 }  // namespace
 
 ImageDecodeResult ImageDecoder::decodeToImage(const QByteArray& data,
                                               const QString& sourceName) {
-  const bool compareContainerDecoders =
-      shouldCompareContainerDecoders(data, sourceName);
+  const bool heifLike = shouldCompareContainerDecoders(data, sourceName);
+  const bool webpLike = shouldDecodeWithWebp(data, sourceName);
 
-  ImageDecodeResult qtResult = decodeWithQt(data, sourceName);
-  if (qtResult.ok && !compareContainerDecoders) {
-    return qtResult;
-  }
-
-  ImageDecodeResult bestResult;
-  keepLargerImage(&bestResult, qtResult);
-
-  ImageDecodeResult heifResult;
-  if (compareContainerDecoders) {
-    heifResult =
-        HeifImageDecoder::decodeToImage(data, sourceName, qtResult.message,
-                                        "已优先使用 libheif，跳过 MagickWand。");
-    keepLargerImage(&bestResult, heifResult);
+  if (heifLike) {
+    ImageDecodeResult heifResult =
+        HeifImageDecoder::decodeToImage(data, sourceName, "未使用 Qt HEIF 插件",
+                                        "未使用通用转码中间层");
     if (heifResult.ok) {
-      return bestResult;
+      return heifResult;
     }
-  }
 
-  ImageDecodeResult imageMagickResult =
-      decodeWithImageMagick(data, sourceName, qtResult.message);
-  if (imageMagickResult.ok && !compareContainerDecoders) {
-    return imageMagickResult;
-  }
-  keepLargerImage(&bestResult, imageMagickResult);
-
-  if (!compareContainerDecoders) {
-    heifResult =
-        HeifImageDecoder::decodeToImage(data, sourceName, qtResult.message,
-                                        imageMagickResult.message);
-    keepLargerImage(&bestResult, heifResult);
-  } else if (!imageMagickResult.ok && !heifResult.ok) {
-    heifResult.message += "。MagickWand 错误: " + imageMagickResult.message;
-  }
-  if (bestResult.ok) {
-    return bestResult;
-  }
-
-  if (!heifResult.ok) {
     const QString diagnosticPath = writeDiagnosticCopy(data, sourceName);
     heifResult.message += "。文件识别: " +
                           imageSignatureSummary(data, sourceName);
     if (!diagnosticPath.isEmpty()) {
       heifResult.message += "。已保存诊断副本: " + diagnosticPath;
     }
+    return heifResult;
   }
-  return heifResult;
+
+  if (webpLike) {
+    ImageDecodeResult webpResult = decodeWithWebp(data);
+    if (webpResult.ok) {
+      return webpResult;
+    }
+
+    const QString diagnosticPath = writeDiagnosticCopy(data, sourceName);
+    webpResult.message += "。文件识别: " +
+                          imageSignatureSummary(data, sourceName);
+    if (!diagnosticPath.isEmpty()) {
+      webpResult.message += "。已保存诊断副本: " + diagnosticPath;
+    }
+    return webpResult;
+  }
+
+#ifdef Q_OS_WIN
+  if (shouldDecodeWithWic(data, sourceName)) {
+    ImageDecodeResult wicResult = WicImageDecoder::decodeToImage(data, sourceName);
+    if (wicResult.ok) {
+      return wicResult;
+    }
+
+    const QString diagnosticPath = writeDiagnosticCopy(data, sourceName);
+    wicResult.message += "。文件识别: " +
+                         imageSignatureSummary(data, sourceName);
+    if (!diagnosticPath.isEmpty()) {
+      wicResult.message += "。已保存诊断副本: " + diagnosticPath;
+    }
+    return wicResult;
+  }
+#endif
+
+  if (shouldDecodeWithQt(data, sourceName)) {
+    ImageDecodeResult qtResult = decodeWithQt(data, sourceName);
+    if (qtResult.ok) {
+      return qtResult;
+    }
+
+    const QString diagnosticPath = writeDiagnosticCopy(data, sourceName);
+    qtResult.message += "。文件识别: " + imageSignatureSummary(data, sourceName);
+    if (!diagnosticPath.isEmpty()) {
+      qtResult.message += "。已保存诊断副本: " + diagnosticPath;
+    }
+    return qtResult;
+  }
+
+#ifndef Q_OS_WIN
+  ImageDecodeResult qtResult = decodeWithQt(data, sourceName);
+  if (qtResult.ok) {
+    return qtResult;
+  }
+#else
+  ImageDecodeResult qtResult =
+      {false, {}, "该格式还没有接入独立底层解码库，已避免使用重复的通用转码链路。",
+       "direct codec router"};
+#endif
+  const QString diagnosticPath = writeDiagnosticCopy(data, sourceName);
+  qtResult.message += "。文件识别: " + imageSignatureSummary(data, sourceName);
+  if (!diagnosticPath.isEmpty()) {
+    qtResult.message += "。已保存诊断副本: " + diagnosticPath;
+  }
+  return qtResult;
 }
 
 QString ImageDecoder::supportedFormatsSummary() {
-  QStringList formats;
-  const QList<QByteArray> supported = QImageReader::supportedImageFormats();
-  for (const QByteArray& format : supported) {
-    formats.push_back(QString::fromLatin1(format).toLower());
-  }
-  formats.removeDuplicates();
-  formats.sort(Qt::CaseInsensitive);
-  return formats.join(", ");
+#ifdef Q_OS_WIN
+  return "WIC: bmp, gif, ico, jpeg, jpg, png, tif, tiff; libwebp: webp; "
+         "libheif: avif, heic, heif; Qt: svg, svgz";
+#else
+  return "libwebp: webp; libheif: avif, heic, heif; Qt: svg and remaining "
+         "platform-supported formats";
+#endif
 }

@@ -93,6 +93,8 @@ QStringList heifLibraryCandidates(const QString& runtimeDir) {
   QStringList candidates;
 #ifdef Q_OS_WIN
   if (!runtimeDir.isEmpty()) {
+    appendUnique(&candidates, QDir(runtimeDir).filePath("libheif.dll"));
+    appendUnique(&candidates, QDir(runtimeDir).filePath("libheif-1.dll"));
     appendUnique(&candidates, QDir(runtimeDir).filePath("CORE_RL_heif_.dll"));
   }
 #else
@@ -143,7 +145,7 @@ class HeifApi {
     }
     attempted_ = true;
 
-    const QString runtimeDir = RuntimePaths::runtimeDirectory("imagemagick");
+    const QString runtimeDir = RuntimePaths::runtimeDirectory("imagecodecs");
     if (!runtimeDir.isEmpty()) {
       RuntimePaths::addDllSearchPath(runtimeDir);
       RuntimePaths::addDllSearchPath(QDir(runtimeDir).filePath("lib"));
@@ -171,8 +173,8 @@ class HeifApi {
     if (!library_.isLoaded()) {
       loadError_ = "加载 libheif 运行库失败。";
       if (runtimeDir.isEmpty()) {
-        loadError_ += " 未找到 runtime/imagemagick 或 "
-                      "third_party/runtime/imagemagick。";
+        loadError_ += " 未找到 runtime/imagecodecs 或 "
+                      "third_party/runtime/imagecodecs。";
       }
       if (!loadErrors.isEmpty()) {
         loadError_ += " 尝试结果: " + loadErrors.join(" | ");
@@ -392,14 +394,14 @@ class ScopedHeifImage {
 
 ImageDecodeResult decodeWithLibheif(const QByteArray& data,
                                     const QString& qtError,
-                                    const QString& imageMagickError) {
+                                    const QString& fallbackError) {
   HeifApi& api = heifApi();
   QString loadError;
   if (!api.ensureLoaded(&loadError)) {
-    return makeFailure("Qt 和 MagickWand 都无法解码该图片，且 libheif "
+    return makeFailure("当前格式需要 libheif，但 libheif "
                        "不可用: " +
                        loadError + "。Qt 错误: " + qtError +
-                       "。MagickWand 错误: " + imageMagickError);
+                       "。兜底信息: " + fallbackError);
   }
 
   if (data.isEmpty()) {

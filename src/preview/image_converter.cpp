@@ -2,7 +2,8 @@
 
 #include <QCryptographicHash>
 
-#include "preview/magick_wand_bridge.h"
+#include "preview/image_decoder.h"
+#include "preview/webp_image_encoder.h"
 
 namespace {
 
@@ -16,8 +17,6 @@ ImageConversionResult ImageConverter::convertToWebp(
     const QByteArray& data,
     const QString& sourceName,
     const QString& hashSource) {
-  Q_UNUSED(sourceName);
-
   ImageConversionResult result;
   result.hashSource = hashSource;
   if (data.isEmpty()) {
@@ -29,9 +28,16 @@ ImageConversionResult ImageConverter::convertToWebp(
   result.md5 = hashHex(data, QCryptographicHash::Md5);
   result.outputName = result.sha256 + ".webp";
 
+  const ImageDecodeResult decoded = ImageDecoder::decodeToImage(data, sourceName);
+  if (!decoded.ok || decoded.image.isNull()) {
+    result.message = "图片解码失败，无法转 WebP: " + decoded.message;
+    return result;
+  }
+
   QString errorMessage;
-  if (!MagickWandBridge::convertToWebp(data, &result.data, &errorMessage)) {
-    result.message = "MagickWand 运行库转 WebP 失败: " + errorMessage;
+  if (!WebpImageEncoder::encode(decoded.image, 85, &result.data,
+                                &errorMessage)) {
+    result.message = "libwebp 转 WebP 失败: " + errorMessage;
     return result;
   }
   result.ok = !result.data.isEmpty();

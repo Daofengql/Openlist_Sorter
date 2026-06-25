@@ -6,21 +6,22 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
-#include <QBuffer>
 #include <QSaveFile>
+
+#include "preview/webp_image_encoder.h"
 
 namespace {
 
 QString extensionForVariant(const QString& variant) {
-  return variant == "raw" ? ".bin" : ".jpg";
+  return variant == "raw" ? ".bin" : ".webp";
 }
 
 QString cacheVersionForVariant(const QString& variant) {
   if (variant == "preview") {
-    return "preview-decode-jpeg-v1";
+    return "preview-decode-webp-v1";
   }
   if (variant == "thumb") {
-    return "thumb-jpeg-v1";
+    return "thumb-webp-v1";
   }
   return "v1";
 }
@@ -111,15 +112,8 @@ QByteArray PreviewCache::encodePreviewImage(const QImage& image) {
   }
 
   QByteArray data;
-  QBuffer buffer(&data);
-  if (!buffer.open(QIODevice::WriteOnly)) {
-    return {};
-  }
-  QImage imageForJpeg = image;
-  if (imageForJpeg.hasAlphaChannel()) {
-    imageForJpeg = imageForJpeg.convertToFormat(QImage::Format_RGB888);
-  }
-  if (!imageForJpeg.save(&buffer, "JPG", 100)) {
+  QString errorMessage;
+  if (!WebpImageEncoder::encode(image, 100, &data, &errorMessage)) {
     return {};
   }
   return data;
@@ -140,8 +134,14 @@ bool PreviewCache::loadImage(const RemoteEntry& entry,
     return false;
   }
 
+  QByteArray data;
+  if (!loadBytesFromPath(path, &data)) {
+    return false;
+  }
+
   QImage loaded;
-  if (!loaded.load(path)) {
+  QString errorMessage;
+  if (!WebpImageEncoder::decode(data, &loaded, &errorMessage)) {
     return false;
   }
   *image = loaded;
@@ -195,8 +195,14 @@ bool PreviewCache::loadThumbnail(const RemoteEntry& entry,
     return false;
   }
 
+  QByteArray data;
+  if (!loadBytesFromPath(path, &data)) {
+    return false;
+  }
+
   QImage loaded;
-  if (!loaded.load(path)) {
+  QString errorMessage;
+  if (!WebpImageEncoder::decode(data, &loaded, &errorMessage)) {
     return false;
   }
   *image = loaded;
