@@ -1015,7 +1015,7 @@ void MainWindow::showAboutDialog() {
 
 void MainWindow::openProjectHomepage() {
   QDesktopServices::openUrl(
-      QUrl("https://github.com/Daofengql/Openlist_Sorter"));
+      QUrl("https://github.com/Daofengql/OpenList-Sorter"));
 }
 
 void MainWindow::openAuthorBlog() {
